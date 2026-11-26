@@ -1090,3 +1090,5 @@ with tabs[tab_idx]:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
+        from pro_modules import render_pro_analytics
+render_pro_analytics(tx_df, analysis, company["name"], curr)
