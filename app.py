@@ -1091,4 +1091,4 @@ with tabs[tab_idx]:
             type="primary",
         )
         from pro_modules import render_pro_analytics
-render_pro_analytics(tx_df, analysis, company["name"], curr)
+        render_pro_analytics(tx_df, analysis, company["name"], curr)
