@@ -1,1096 +1,1921 @@
 import io
+import re
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+try:
+    from fpdf import FPDF
+    FPDF_AVAILABLE = True
+except ImportError:
+    FPDF_AVAILABLE = False
+
+# =========================================================
+# 1. SAHIFA SOZLAMALARI VA ZAMONAVIY SODDA DIZAYN (CSS)
+# =========================================================
 st.set_page_config(
-    page_title="Universal Biznes Analitika Platformasi v3.0",
-    page_icon="🏢",
+    page_title="Biznes Yordamchi — Moliyaviy Tahlil",
+    page_icon="📊",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-DB_PATH = "biznes_analitika.db"
+CUSTOM_CSS = """
+<style>
+    /* Umumiy fon va shrift */
+    .stApp {
+        background-color: #F6F8FB;
+        color: #1E293B;
+    }
+    .block-container {
+        padding-top: 1.4rem;
+        padding-bottom: 2.5rem;
+        max-width: 1280px;
+    }
+    /* Yon menyu (Sidebar) */
+    section[data-testid="stSidebar"] {
+        background-color: #FFFFFF;
+        border-right: 1px solid #E2E8F0;
+    }
+    section[data-testid="stSidebar"] .stRadio > div {
+        gap: 6px;
+    }
+    section[data-testid="stSidebar"] .stRadio label {
+        background-color: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 10px;
+        padding: 10px 14px !important;
+        transition: all 0.15s ease;
+        cursor: pointer;
+        font-weight: 500;
+    }
+    section[data-testid="stSidebar"] .stRadio label:hover {
+        background-color: #EFF6FF;
+        border-color: #93C5FD;
+    }
+    /* Yuqori sarlavha kartasi */
+    .hero-card {
+        background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 100%);
+        color: #FFFFFF;
+        padding: 22px 26px;
+        border-radius: 16px;
+        margin-bottom: 18px;
+        box-shadow: 0 4px 14px rgba(30, 58, 138, 0.14);
+    }
+    .hero-title {
+        font-size: 1.55rem;
+        font-weight: 700;
+        margin: 0 0 6px 0;
+        color: #FFFFFF;
+    }
+    .hero-sub {
+        font-size: 0.96rem;
+        opacity: 0.92;
+        margin: 0;
+        color: #E0E7FF;
+    }
+    /* Metrika kartalari */
+    .kpi-card {
+        background: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 14px;
+        padding: 18px 20px;
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04);
+        height: 100%;
+    }
+    .kpi-label {
+        font-size: 0.85rem;
+        color: #64748B;
+        font-weight: 600;
+        margin-bottom: 6px;
+    }
+    .kpi-value {
+        font-size: 1.45rem;
+        font-weight: 700;
+        color: #0F172A;
+        margin-bottom: 4px;
+    }
+    .kpi-note {
+        font-size: 0.82rem;
+        font-weight: 500;
+    }
+    .kpi-good { color: #15803D; }
+    .kpi-warn { color: #B45309; }
+    .kpi-bad  { color: #B91C1C; }
+    .kpi-muted { color: #64748B; }
 
-# ---------------------------------------------------------
-# 1. FAOLIYAT TURLARI KONFIGURATSIYASI (SOHAVIY MANTIQLAR)
-# ---------------------------------------------------------
-INDUSTRY_CONFIG = {
-    "Savdo (Chakana / Ulgurji)": {
-        "group_label": "Filial / Do'kon",
-        "item_label": "Mahsulot (SKU)",
-        "qty_label": "Sotilgan soni",
-        "cogs_label": "Tovar tannarxi (COGS)",
-        "extra_label": "Qaytarilgan soni (Vozvrat)",
-        "extra_type": "qty",
-        "uses_inventory": True,
-        "expenses": ["Ijara", "Ish haqi", "Logistika", "Marketing", "Kommunal", "Soliq", "Boshqa"],
-        "norms": {"min_net_margin": 12.0, "max_cogs_pct": 70.0, "max_extra_pct": 5.0},
-    },
-    "Ishlab chiqarish (Zavod / Sex)": {
-        "group_label": "Sex / Ishlab chiqarish liniyasi",
-        "item_label": "Tayyor mahsulot",
-        "qty_label": "Ishlab chiqarilgan soni",
-        "cogs_label": "Xomashyo va material sarfi",
-        "extra_label": "Brak (yaroqsiz) soni",
-        "extra_type": "qty",
-        "uses_inventory": True,
-        "expenses": ["Ish haqi (ishchilar)", "Elektr va Gaz", "Uskuna ta'miri", "Logistika", "Ijara", "Qadoqlash", "Boshqa"],
-        "norms": {"min_net_margin": 15.0, "max_cogs_pct": 65.0, "max_extra_pct": 3.0},
-    },
-    "Xizmat ko'rsatish (IT, Klinika, Ta'lim, Servis)": {
-        "group_label": "Bo'lim / Mutaxassis",
-        "item_label": "Xizmat turi",
-        "qty_label": "Mijoz / Buyurtma soni",
-        "cogs_label": "To'g'ridan-to'g'ri xarajat (sarflanuvchi)",
-        "extra_label": "Sarflangan ish soati",
-        "extra_type": "hours",
-        "uses_inventory": False,
-        "expenses": ["Mutaxassislar ish haqi", "Ofis ijarasi", "Reklama va Marketing", "Dasturiy ta'minot", "Kommunal", "Boshqa"],
-        "norms": {"min_net_margin": 25.0, "max_cogs_pct": 30.0, "max_extra_pct": 0.0},
-    },
-    "Umumiy ovqatlanish (Restoran / Kafe / HoReCa)": {
-        "group_label": "Filial / Zal",
-        "item_label": "Taom / Menyu bo'limi",
-        "qty_label": "Cheklar / Porsiya soni",
-        "cogs_label": "Mahsulot sarfi (Food Cost)",
-        "extra_label": "Isrof / Spisaniye summasi",
-        "extra_type": "money",
-        "uses_inventory": True,
-        "expenses": ["Xodimlar ish haqi (Labor)", "Ijara", "Kommunal", "Yetkazib berish", "Marketing", "Boshqa"],
-        "norms": {"min_net_margin": 15.0, "max_cogs_pct": 35.0, "max_extra_pct": 4.0},
-    },
-    "Qurilish va Loyihaviy biznes": {
-        "group_label": "Obyekt / Loyiha nomi",
-        "item_label": "Ish bosqichi / Yo'nalish",
-        "qty_label": "Hajm (m² / birlik)",
-        "cogs_label": "Qurilish materiali va subpudrat",
-        "extra_label": "Rejadan ortiqcha xarajat / Jarima",
-        "extra_type": "money",
-        "uses_inventory": True,
-        "expenses": ["Usta va muhandislar ish haqi", "Texnika ijarasi", "Transport/Logistika", "Ofis va boshqaruv", "Soliq", "Boshqa"],
-        "norms": {"min_net_margin": 18.0, "max_cogs_pct": 68.0, "max_extra_pct": 5.0},
-    },
+    /* Muammo va tavsiya kartalari */
+    .issue-card {
+        background: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-left: 5px solid #2563EB;
+        border-radius: 12px;
+        padding: 16px 18px;
+        margin-bottom: 12px;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+    }
+    .issue-high { border-left-color: #DC2626; }
+    .issue-mid  { border-left-color: #D97706; }
+    .issue-low  { border-left-color: #16A34A; }
+
+    /* Oddiy yordamchi banner */
+    .hint-box {
+        background: #EFF6FF;
+        border: 1px solid #BFDBFE;
+        border-radius: 12px;
+        padding: 14px 18px;
+        color: #1E3A8A;
+        margin-bottom: 14px;
+        font-size: 0.93rem;
+    }
+    /* Streamlit standart elementlarini chiroyliroq qilish */
+    div[data-testid="stMetric"] {
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        padding: 14px 16px;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background-color: transparent;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 10px;
+        padding: 8px 16px;
+        font-weight: 600;
+        color: #334155;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #1E3A8A !important;
+        color: #FFFFFF !important;
+        border-color: #1E3A8A !important;
+    }
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# =========================================================
+# 2. MA'LUMOTLAR BAZASI (SQLITE) VA SOHA ME'YORLARI
+# =========================================================
+DB_PATH = "biznes_yordamchi.db"
+
+SOHALAR = {
+    "Savdo (Do'kon / Ulgurji)": {"min_marja": 12.0, "max_ombor_kun": 45, "max_qarz_kun": 25},
+    "Ishlab chiqarish": {"min_marja": 15.0, "max_ombor_kun": 60, "max_qarz_kun": 35},
+    "Xizmat ko'rsatish": {"min_marja": 22.0, "max_ombor_kun": 15, "max_qarz_kun": 20},
+    "Umumiy ovqatlanish (Kafe / Restoran)": {"min_marja": 18.0, "max_ombor_kun": 10, "max_qarz_kun": 10},
+    "Qurilish va ta'mirlash": {"min_marja": 14.0, "max_ombor_kun": 50, "max_qarz_kun": 40},
+}
+
+DEFAULT_PROFILE = {
+    "davr_kun": 30,
+    "jami_mijozlar": 120,
+    "yangi_mijozlar": 25,
+    "qayta_mijozlar": 55,
+    "reklama_xarajati": 6_000_000.0,
+    "mijoz_davomiyligi_oy": 8.0,
+    "top3_mijoz_ulushi": 35.0,
+    "xodimlar_soni": 10,
+    "oylik_fondi": 40_000_000.0,
+    "ketgan_xodimlar": 1,
+    "reja_bajarilishi": 80.0,
+    "brak_qaytarilish": 3.0,
+    "bajarilish_vaqti_kun": 2.0,
+    "quvvat_bandligi": 75.0,
+    "asosiy_yetkazuvchi_ulushi": 40.0,
 }
 
 
-# ---------------------------------------------------------
-# 2. SQLITE MA'LUMOTLAR BAZASI QATLAMI
-# ---------------------------------------------------------
-def get_conn() -> sqlite3.Connection:
+def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db() -> None:
-    with get_conn() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS companies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                industry TEXT NOT NULL,
-                currency TEXT NOT NULL DEFAULT 'UZS',
-                start_cash REAL NOT NULL DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_id INTEGER NOT NULL,
-                tx_date TEXT NOT NULL,
-                group_name TEXT NOT NULL,
-                item_name TEXT NOT NULL,
-                expense_type TEXT NOT NULL,
-                quantity REAL NOT NULL DEFAULT 1,
-                revenue REAL NOT NULL DEFAULT 0,
-                cogs REAL NOT NULL DEFAULT 0,
-                opex REAL NOT NULL DEFAULT 0,
-                extra_metric REAL NOT NULL DEFAULT 0,
-                notes TEXT DEFAULT '',
-                FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS debts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_id INTEGER NOT NULL,
-                partner TEXT NOT NULL,
-                debt_type TEXT NOT NULL,
-                due_date TEXT NOT NULL,
-                amount REAL NOT NULL DEFAULT 0,
-                notes TEXT DEFAULT '',
-                FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS inventory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_id INTEGER NOT NULL,
-                item_name TEXT NOT NULL,
-                warehouse TEXT NOT NULL DEFAULT 'Asosiy ombor',
-                qty REAL NOT NULL DEFAULT 0,
-                unit_cost REAL NOT NULL DEFAULT 0,
-                last_sale_date TEXT NOT NULL,
-                monthly_sales REAL NOT NULL DEFAULT 0,
-                FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
-            );
-            """
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS companies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            sector TEXT NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'so''m',
+            cash_balance REAL NOT NULL DEFAULT 0,
+            created_at TEXT
         )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            tx_date TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'Umumiy',
+            item_name TEXT NOT NULL,
+            qty REAL NOT NULL DEFAULT 1,
+            revenue REAL NOT NULL DEFAULT 0,
+            cogs REAL NOT NULL DEFAULT 0,
+            opex REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS debts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            counterparty TEXT NOT NULL,
+            debt_type TEXT NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            due_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Faol'
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            item_name TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'Umumiy',
+            qty REAL NOT NULL DEFAULT 0,
+            unit_cost REAL NOT NULL DEFAULT 0,
+            last_sale_date TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS company_profile (
+            company_id INTEGER PRIMARY KEY,
+            davr_kun INTEGER DEFAULT 30,
+            jami_mijozlar INTEGER DEFAULT 120,
+            yangi_mijozlar INTEGER DEFAULT 25,
+            qayta_mijozlar INTEGER DEFAULT 55,
+            reklama_xarajati REAL DEFAULT 6000000,
+            mijoz_davomiyligi_oy REAL DEFAULT 8,
+            top3_mijoz_ulushi REAL DEFAULT 35,
+            xodimlar_soni INTEGER DEFAULT 10,
+            oylik_fondi REAL DEFAULT 40000000,
+            ketgan_xodimlar INTEGER DEFAULT 1,
+            reja_bajarilishi REAL DEFAULT 80,
+            brak_qaytarilish REAL DEFAULT 3,
+            bajarilish_vaqti_kun REAL DEFAULT 2,
+            quvvat_bandligi REAL DEFAULT 75,
+            asosiy_yetkazuvchi_ulushi REAL DEFAULT 40
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
 
 
-def get_companies() -> list[dict]:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM companies ORDER BY id DESC").fetchall()
-        return [dict(r) for r in rows]
+def ensure_default_company():
+    conn = get_conn()
+    cnt = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+    if cnt == 0:
+        conn.execute(
+            "INSERT INTO companies (name, sector, currency, cash_balance, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("Mening Korxonam", "Savdo (Do'kon / Ulgurji)", "so'm", 45_000_000.0, datetime.now().isoformat()),
+        )
+        conn.commit()
+    conn.close()
 
 
-def create_company(name: str, industry: str, currency: str, start_cash: float) -> tuple[bool, str]:
+def list_companies() -> list:
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM companies ORDER BY id ASC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_company(name: str, sector: str, currency: str, cash_balance: float) -> tuple:
+    clean = str(name).strip()
+    if not clean:
+        return False, "Korxona nomini kiriting."
+    conn = get_conn()
     try:
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO companies (name, industry, currency, start_cash) VALUES (?, ?, ?, ?)",
-                (name.strip(), industry, currency, float(start_cash)),
-            )
-        return True, "Korxona muvaffaqiyatli yaratildi!"
+        conn.execute(
+            "INSERT INTO companies (name, sector, currency, cash_balance, created_at) VALUES (?, ?, ?, ?, ?)",
+            (clean, sector, currency, float(cash_balance), datetime.now().isoformat()),
+        )
+        conn.commit()
+        return True, f"'{clean}' korxonasi qo'shildi."
     except sqlite3.IntegrityError:
-        return False, "Bunday nomli korxona bazada allaqachon mavjud."
+        return False, "Bu nomdagi korxona allaqachon mavjud."
+    finally:
+        conn.close()
 
 
-def update_company_cash(company_id: int, new_cash: float) -> None:
-    with get_conn() as conn:
-        conn.execute("UPDATE companies SET start_cash = ? WHERE id = ?", (float(new_cash), company_id))
+def update_company_cash(company_id: int, cash_balance: float):
+    conn = get_conn()
+    conn.execute("UPDATE companies SET cash_balance = ? WHERE id = ?", (float(cash_balance), int(company_id)))
+    conn.commit()
+    conn.close()
 
 
-def delete_company(company_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM transactions WHERE company_id = ?", (company_id,))
-        conn.execute("DELETE FROM debts WHERE company_id = ?", (company_id,))
-        conn.execute("DELETE FROM inventory WHERE company_id = ?", (company_id,))
-        conn.execute("DELETE FROM companies WHERE id = ?", (company_id,))
+def delete_company(company_id: int):
+    conn = get_conn()
+    for tbl in ("transactions", "debts", "inventory", "company_profile"):
+        conn.execute(f"DELETE FROM {tbl} WHERE company_id = ?", (int(company_id),))
+    conn.execute("DELETE FROM companies WHERE id = ?", (int(company_id),))
+    conn.commit()
+    conn.close()
 
 
 def load_table(table: str, company_id: int) -> pd.DataFrame:
-    with get_conn() as conn:
-        return pd.read_sql_query(f"SELECT * FROM {table} WHERE company_id = ?", conn, params=(company_id,))
+    conn = get_conn()
+    df = pd.read_sql_query(f"SELECT * FROM {table} WHERE company_id = ?", conn, params=(int(company_id),))
+    conn.close()
+    return df
 
 
-def insert_transaction(company_id: int, rec: dict) -> None:
-    with get_conn() as conn:
-        conn.execute(
+def replace_transactions(company_id: int, df: pd.DataFrame):
+    conn = get_conn()
+    conn.execute("DELETE FROM transactions WHERE company_id = ?", (int(company_id),))
+    if df is not None and not df.empty:
+        rows = []
+        for _, r in df.iterrows():
+            rows.append((
+                int(company_id),
+                _clean_date_str(r.get("tx_date")),
+                _clean_text(r.get("category"), "Umumiy"),
+                _clean_text(r.get("item_name"), "Nomsiz mahsulot"),
+                _clean_num(r.get("qty"), 1.0),
+                _clean_num(r.get("revenue"), 0.0),
+                _clean_num(r.get("cogs"), 0.0),
+                _clean_num(r.get("opex"), 0.0),
+            ))
+        conn.executemany(
             """
-            INSERT INTO transactions
-            (company_id, tx_date, group_name, item_name, expense_type, quantity, revenue, cogs, opex, extra_metric, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO transactions (company_id, tx_date, category, item_name, qty, revenue, cogs, opex)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                company_id,
-                str(rec["tx_date"]),
-                str(rec["group_name"]),
-                str(rec["item_name"]),
-                str(rec["expense_type"]),
-                float(rec["quantity"]),
-                float(rec["revenue"]),
-                float(rec["cogs"]),
-                float(rec["opex"]),
-                float(rec["extra_metric"]),
-                str(rec.get("notes", "")),
-            ),
+            rows,
         )
+    conn.commit()
+    conn.close()
 
 
-def replace_transactions(company_id: int, df: pd.DataFrame) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM transactions WHERE company_id = ?", (company_id,))
+def append_transactions(company_id: int, df: pd.DataFrame):
+    if df is None or df.empty:
+        return
+    conn = get_conn()
+    rows = []
+    for _, r in df.iterrows():
+        rows.append((
+            int(company_id),
+            _clean_date_str(r.get("tx_date")),
+            _clean_text(r.get("category"), "Umumiy"),
+            _clean_text(r.get("item_name"), "Nomsiz mahsulot"),
+            _clean_num(r.get("qty"), 1.0),
+            _clean_num(r.get("revenue"), 0.0),
+            _clean_num(r.get("cogs"), 0.0),
+            _clean_num(r.get("opex"), 0.0),
+        ))
+    conn.executemany(
+        """
+        INSERT INTO transactions (company_id, tx_date, category, item_name, qty, revenue, cogs, opex)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def replace_debts(company_id: int, df: pd.DataFrame):
+    conn = get_conn()
+    conn.execute("DELETE FROM debts WHERE company_id = ?", (int(company_id),))
+    if df is not None and not df.empty:
+        rows = []
         for _, r in df.iterrows():
-            if pd.isna(r["tx_date"]) or str(r["item_name"]).strip() == "":
-                continue
-            dt_str = pd.to_datetime(r["tx_date"]).strftime("%Y-%m-%d")
-            conn.execute(
-                """
-                INSERT INTO transactions
-                (company_id, tx_date, group_name, item_name, expense_type, quantity, revenue, cogs, opex, extra_metric, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    company_id,
-                    dt_str,
-                    str(r.get("group_name", "Asosiy") or "Asosiy"),
-                    str(r["item_name"]),
-                    str(r.get("expense_type", "Boshqa") or "Boshqa"),
-                    float(pd.to_numeric(r.get("quantity", 1), errors="coerce") or 0),
-                    float(pd.to_numeric(r.get("revenue", 0), errors="coerce") or 0),
-                    float(pd.to_numeric(r.get("cogs", 0), errors="coerce") or 0),
-                    float(pd.to_numeric(r.get("opex", 0), errors="coerce") or 0),
-                    float(pd.to_numeric(r.get("extra_metric", 0), errors="coerce") or 0),
-                    str(r.get("notes", "") or ""),
-                ),
-            )
-
-
-def insert_debt(company_id: int, rec: dict) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO debts (company_id, partner, debt_type, due_date, amount, notes) VALUES (?, ?, ?, ?, ?, ?)",
-            (company_id, rec["partner"], rec["debt_type"], str(rec["due_date"]), float(rec["amount"]), rec.get("notes", "")),
+            rows.append((
+                int(company_id),
+                _clean_text(r.get("counterparty"), "Noma'lum hamkor"),
+                _normalize_debt_type(r.get("debt_type")),
+                _clean_num(r.get("amount"), 0.0),
+                _clean_date_str(r.get("due_date")),
+                _normalize_debt_status(r.get("status"), _clean_date_str(r.get("due_date"))),
+            ))
+        conn.executemany(
+            "INSERT INTO debts (company_id, counterparty, debt_type, amount, due_date, status) VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
         )
+    conn.commit()
+    conn.close()
 
 
-def replace_debts(company_id: int, df: pd.DataFrame) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM debts WHERE company_id = ?", (company_id,))
+def replace_inventory(company_id: int, df: pd.DataFrame):
+    conn = get_conn()
+    conn.execute("DELETE FROM inventory WHERE company_id = ?", (int(company_id),))
+    if df is not None and not df.empty:
+        rows = []
         for _, r in df.iterrows():
-            if pd.isna(r["due_date"]) or str(r["partner"]).strip() == "":
-                continue
-            dt_str = pd.to_datetime(r["due_date"]).strftime("%Y-%m-%d")
-            conn.execute(
-                "INSERT INTO debts (company_id, partner, debt_type, due_date, amount, notes) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    company_id,
-                    str(r["partner"]),
-                    str(r["debt_type"]),
-                    dt_str,
-                    float(pd.to_numeric(r["amount"], errors="coerce") or 0),
-                    str(r.get("notes", "") or ""),
-                ),
-            )
-
-
-def insert_inventory(company_id: int, rec: dict) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO inventory (company_id, item_name, warehouse, qty, unit_cost, last_sale_date, monthly_sales)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                company_id,
-                rec["item_name"],
-                rec["warehouse"],
-                float(rec["qty"]),
-                float(rec["unit_cost"]),
-                str(rec["last_sale_date"]),
-                float(rec["monthly_sales"]),
-            ),
+            rows.append((
+                int(company_id),
+                _clean_text(r.get("item_name"), "Nomsiz tovar"),
+                _clean_text(r.get("category"), "Umumiy"),
+                _clean_num(r.get("qty"), 0.0),
+                _clean_num(r.get("unit_cost"), 0.0),
+                _clean_date_str(r.get("last_sale_date")),
+            ))
+        conn.executemany(
+            "INSERT INTO inventory (company_id, item_name, category, qty, unit_cost, last_sale_date) VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
         )
+    conn.commit()
+    conn.close()
 
 
-def replace_inventory(company_id: int, df: pd.DataFrame) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM inventory WHERE company_id = ?", (company_id,))
-        for _, r in df.iterrows():
-            if pd.isna(r["last_sale_date"]) or str(r["item_name"]).strip() == "":
-                continue
-            dt_str = pd.to_datetime(r["last_sale_date"]).strftime("%Y-%m-%d")
-            conn.execute(
-                """
-                INSERT INTO inventory (company_id, item_name, warehouse, qty, unit_cost, last_sale_date, monthly_sales)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    company_id,
-                    str(r["item_name"]),
-                    str(r.get("warehouse", "Asosiy ombor") or "Asosiy ombor"),
-                    float(pd.to_numeric(r["qty"], errors="coerce") or 0),
-                    float(pd.to_numeric(r["unit_cost"], errors="coerce") or 0),
-                    dt_str,
-                    float(pd.to_numeric(r["monthly_sales"], errors="coerce") or 0),
-                ),
-            )
-
-
-# ---------------------------------------------------------
-# 3. YORDAMCHI FORMATLASH VA SHABLON GENERATORLARI
-# ---------------------------------------------------------
-def fmt_money(val: float, curr: str) -> str:
-    return f"{val:,.0f} {curr}".replace(",", " ")
-
-
-def build_empty_template_excel(cfg: dict) -> bytes:
-    """Tanlangan faoliyat turi uchun bo'sh Excel kiritish shablonini yaratadi."""
-    buf = io.BytesIO()
-    tx_cols = [
-        "Sana (YYYY-MM-DD)",
-        cfg["group_label"],
-        cfg["item_label"],
-        "Xarajat turi",
-        cfg["qty_label"],
-        "Tushum",
-        cfg["cogs_label"],
-        "Operatsion xarajat (OPEX)",
-        cfg["extra_label"],
-        "Izoh",
-    ]
-    debt_cols = ["Kontragent", "Tur (Debitor / Kreditor)", "Tolov muddati (YYYY-MM-DD)", "Summa", "Izoh"]
-    inv_cols = ["Mahsulot", "Ombor", "Qoldiq soni", "Birlik tannarxi", "Oxirgi sotuv sanasi (YYYY-MM-DD)", "Oylik ortacha sotuv"]
-
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pd.DataFrame(columns=tx_cols).to_excel(writer, index=False, sheet_name="Operatsiyalar")
-        pd.DataFrame(columns=debt_cols).to_excel(writer, index=False, sheet_name="Qarzlar")
-        if cfg["uses_inventory"]:
-            pd.DataFrame(columns=inv_cols).to_excel(writer, index=False, sheet_name="Ombor")
-    return buf.getvalue()
-
-
-def export_analysis_excel(tx_df: pd.DataFrame, item_df: pd.DataFrame, group_df: pd.DataFrame, debts_df: pd.DataFrame, inv_df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        if not item_df.empty:
-            item_df.to_excel(writer, index=False, sheet_name="Mahsulot_Xizmat_Tahlili")
-        if not group_df.empty:
-            group_df.to_excel(writer, index=False, sheet_name="Filial_Loyiha_Tahlili")
-        if not tx_df.empty:
-            tx_df.to_excel(writer, index=False, sheet_name="Barcha_Operatsiyalar")
-        if not debts_df.empty:
-            debts_df.to_excel(writer, index=False, sheet_name="Qarzlar")
-        if not inv_df.empty:
-            inv_df.to_excel(writer, index=False, sheet_name="Ombor")
-    return buf.getvalue()
-
-
-# ---------------------------------------------------------
-# 4. SOHAGA MOSLASHUVCHAN ANALITIKA VA DIAGNOSTIKA DVIGATELI
-# ---------------------------------------------------------
-def analyze_company(
-    tx_df: pd.DataFrame,
-    debts_df: pd.DataFrame,
-    inv_df: pd.DataFrame,
-    industry: str,
-    cfg: dict,
-    start_cash: float,
-    forecast_days: int,
-    ar_recovery_pct: float,
-    curr: str,
-) -> dict:
-    recs = []
-    res = {"has_tx": not tx_df.empty}
-
-    if tx_df.empty:
-        return res
-
-    df = tx_df.copy()
-    df["tx_date"] = pd.to_datetime(df["tx_date"], errors="coerce")
-    df = df.dropna(subset=["tx_date"]).sort_values("tx_date")
-    df["Oy"] = df["tx_date"].dt.to_period("M").astype(str)
-    df["Sof_foyda"] = df["revenue"] - df["cogs"] - df["opex"]
-    ref_date = max(df["tx_date"].max(), pd.Timestamp(date.today()))
-
-    total_rev = df["revenue"].sum()
-    total_cogs = df["cogs"].sum()
-    total_opex = df["opex"].sum()
-    total_qty = df["quantity"].sum()
-    total_extra = df["extra_metric"].sum()
-    gross_profit = total_rev - total_cogs
-    net_profit = gross_profit - total_opex
-    net_margin = (net_profit / total_rev * 100) if total_rev > 0 else 0.0
-    cogs_pct = (total_cogs / total_rev * 100) if total_rev > 0 else 0.0
-    opex_pct = (total_opex / total_rev * 100) if total_rev > 0 else 0.0
-
-    # 1) Mahsulot / Xizmat kesimida tahlil
-    item_df = df.groupby("item_name", as_index=False).agg(
-        Miqdor=("quantity", "sum"),
-        Tushum=("revenue", "sum"),
-        Tannarx=("cogs", "sum"),
-        OPEX=("opex", "sum"),
-        Qoshimcha=("extra_metric", "sum"),
-    )
-    item_df["Sof_foyda"] = item_df["Tushum"] - item_df["Tannarx"] - item_df["OPEX"]
-    item_df["Marja_%"] = np.where(item_df["Tushum"] > 0, item_df["Sof_foyda"] / item_df["Tushum"] * 100, 0.0)
-    item_df["Birlik_tannarx"] = np.where(item_df["Miqdor"] > 0, item_df["Tannarx"] / item_df["Miqdor"], 0.0)
-    item_df = item_df.sort_values("Sof_foyda", ascending=True)
-    loss_items = item_df[item_df["Sof_foyda"] < 0]
-
-    # ABC tahlil
-    abc_df = item_df.sort_values("Tushum", ascending=False).copy()
-    abc_df["Ulush_%"] = (abc_df["Tushum"] / total_rev * 100) if total_rev > 0 else 0.0
-    abc_df["Kumulyativ_%"] = abc_df["Ulush_%"].cumsum()
-    abc_df["ABC"] = np.where(
-        abc_df["Kumulyativ_%"] <= 80, "A (Asosiy)", np.where(abc_df["Kumulyativ_%"] <= 95, "B (O'rta)", "C (Past)")
-    )
-
-    # 2) Filial / Sex / Bo'lim / Obyekt tahlili
-    group_df = df.groupby("group_name", as_index=False).agg(
-        Tushum=("revenue", "sum"), Tannarx=("cogs", "sum"), OPEX=("opex", "sum"), Qoshimcha=("extra_metric", "sum")
-    )
-    group_df["Sof_foyda"] = group_df["Tushum"] - group_df["Tannarx"] - group_df["OPEX"]
-    group_df["Marja_%"] = np.where(group_df["Tushum"] > 0, group_df["Sof_foyda"] / group_df["Tushum"] * 100, 0.0)
-    group_df = group_df.sort_values("Marja_%", ascending=True)
-
-    # 3) Oylik dinamika va Anomaliyalar
-    monthly_df = df.groupby("Oy", as_index=False).agg(
-        Tushum=("revenue", "sum"), Tannarx=("cogs", "sum"), OPEX=("opex", "sum")
-    ).sort_values("Oy")
-    monthly_df["Sof_foyda"] = monthly_df["Tushum"] - monthly_df["Tannarx"] - monthly_df["OPEX"]
-    opex_mean = monthly_df["OPEX"].mean()
-    opex_std = monthly_df["OPEX"].std(ddof=0)
-    monthly_df["Z_score"] = (monthly_df["OPEX"] - opex_mean) / opex_std if (opex_std > 0 and len(monthly_df) >= 3) else 0.0
-    anomalies = monthly_df[monthly_df["Z_score"] > 1.3]
-
-    # 4) Xarajat moddalari
-    exp_df = df.groupby("expense_type", as_index=False).agg(OPEX=("opex", "sum")).sort_values("OPEX", ascending=False)
-    exp_df["Ulush_%"] = (exp_df["OPEX"] / total_opex * 100) if total_opex > 0 else 0.0
-
-    # 5) SOHAGA XOS MAXSUS KO'RSATKICHLAR VA ME'YORLAR
-    industry_kpis = []
-    norms = cfg["norms"]
-
-    if industry == "Umumiy ovqatlanish (Restoran / Kafe / HoReCa)":
-        labor_cost = df[df["expense_type"].str.lower().str.contains("ish haqi|labor")]["opex"].sum()
-        prime_cost_pct = ((total_cogs + labor_cost) / total_rev * 100) if total_rev > 0 else 0.0
-        avg_check = (total_rev / total_qty) if total_qty > 0 else 0.0
-        waste_pct = (total_extra / total_cogs * 100) if total_cogs > 0 else 0.0
-        industry_kpis = [
-            ("Food Cost %", f"{cogs_pct:.1f}%", f"Me'yor: ≤ {norms['max_cogs_pct']}%", cogs_pct <= norms["max_cogs_pct"]),
-            ("Prime Cost (Food+Labor)", f"{prime_cost_pct:.1f}%", "Me'yor: ≤ 65%", prime_cost_pct <= 65),
-            ("O'rtacha chek", fmt_money(avg_check, curr), f"Jami {total_qty:,.0f} chek", True),
-            ("Isrof ulushi", f"{waste_pct:.1f}%", f"Me'yor: ≤ {norms['max_extra_pct']}%", waste_pct <= norms["max_extra_pct"]),
-        ]
-        if cogs_pct > norms["max_cogs_pct"]:
-            recs.append(("Yuqori xavf", "HoReCa Food Cost", f"Food Cost {cogs_pct:.1f}% ni tashkil etmoqda (me'yor ≤35%).", "Texnologik kartalarni qayta tekshiring, yetkazib beruvchilarni almashtiring yoki menyu narxini oshiring."))
-        if waste_pct > norms["max_extra_pct"]:
-            recs.append(("Ogohlantirish", "Isrof nazorati", f"Mahsulot isrofi {fmt_money(total_extra, curr)} ({waste_pct:.1f}%) ga yetgan.", "Kunlik xarid hajmini cheklar soniga bog'lang va oshxona omborini nazorat qiling."))
-
-    elif industry == "Ishlab chiqarish (Zavod / Sex)":
-        defect_rate = (total_extra / total_qty * 100) if total_qty > 0 else 0.0
-        unit_cost = (total_cogs / total_qty) if total_qty > 0 else 0.0
-        unit_full_cost = ((total_cogs + total_opex) / total_qty) if total_qty > 0 else 0.0
-        industry_kpis = [
-            ("Brak (Yaroqsiz) darajasi", f"{defect_rate:.2f}%", f"Me'yor: ≤ {norms['max_extra_pct']}%", defect_rate <= norms["max_extra_pct"]),
-            ("Xomashyo ulushi", f"{cogs_pct:.1f}%", f"Me'yor: ≤ {norms['max_cogs_pct']}%", cogs_pct <= norms["max_cogs_pct"]),
-            ("O'rtacha xomashyo tannarxi", fmt_money(unit_cost, curr), "1 birlik uchun", True),
-            ("To'liq birlik tannarxi", fmt_money(unit_full_cost, curr), "Xomashyo + OPEX", True),
-        ]
-        if defect_rate > norms["max_extra_pct"]:
-            recs.append(("Yuqori xavf", "Ishlab chiqarish braki", f"Brak ulushi {defect_rate:.1f}% ({total_extra:,.0f} dona) bo'lib, me'yordan yuqori.", "Sifat nazorati (OTK) bosqichini kuchaytiring va brak ko'p chiqayotgan sex/uskunani ta'mirlang."))
-
-    elif industry == "Xizmat ko'rsatish (IT, Klinika, Ta'lim, Servis)":
-        rev_per_hour = (total_rev / total_extra) if total_extra > 0 else 0.0
-        profit_per_hour = (net_profit / total_extra) if total_extra > 0 else 0.0
-        avg_order = (total_rev / total_qty) if total_qty > 0 else 0.0
-        industry_kpis = [
-            ("1 soatlik tushum", fmt_money(rev_per_hour, curr), f"Jami {total_extra:,.1f} soat", True),
-            ("1 soatlik sof foyda", fmt_money(profit_per_hour, curr), "Vaqt samaradorligi", profit_per_hour > 0),
-            ("O'rtacha buyurtma narxi", fmt_money(avg_order, curr), f"{total_qty:,.0f} ta mijoz/xizmat", True),
-            ("Sof marja", f"{net_margin:.1f}%", f"Me'yor: ≥ {norms['min_net_margin']}%", net_margin >= norms["min_net_margin"]),
-        ]
-        if net_margin < norms["min_net_margin"]:
-            recs.append(("Ogohlantirish", "Xizmat marjasi", f"Sof marja ({net_margin:.1f}%) xizmat sohasi me'yoridan ({norms['min_net_margin']}%) past.", "1 soatlik daromadi past bo'lgan xizmatlar narxini ko'taring yoki bajarish vaqtini avtomatlashtiring."))
-
-    elif industry == "Qurilish va Loyihaviy biznes":
-        overrun_pct = (total_extra / total_rev * 100) if total_rev > 0 else 0.0
-        industry_kpis = [
-            ("Material/Subpudrat ulushi", f"{cogs_pct:.1f}%", f"Me'yor: ≤ {norms['max_cogs_pct']}%", cogs_pct <= norms["max_cogs_pct"]),
-            ("Rejadan ortiqcha sarf", fmt_money(total_extra, curr), f"Tushumning {overrun_pct:.1f}% i", overrun_pct <= norms["max_extra_pct"]),
-            ("Obyektlar soni", f"{df['group_name'].nunique()} ta", "Faol loyihalar", True),
-            ("Loyiha sof marjasi", f"{net_margin:.1f}%", f"Me'yor: ≥ {norms['min_net_margin']}%", net_margin >= norms["min_net_margin"]),
-        ]
-        if overrun_pct > norms["max_extra_pct"]:
-            recs.append(("Yuqori xavf", "Byudjetdan og'ish", f"Rejadan ortiqcha xarajat/jarima {fmt_money(total_extra, curr)} ni tashkil etdi.", "Smeta nazoratini haftalik rejimga o'tkazing va xaridlarda oldindan narx fiksatsiya qiling."))
-
-    else:  # Savdo
-        return_rate = (total_extra / total_qty * 100) if total_qty > 0 else 0.0
-        gross_margin = (gross_profit / total_rev * 100) if total_rev > 0 else 0.0
-        avg_sale = (total_rev / total_qty) if total_qty > 0 else 0.0
-        industry_kpis = [
-            ("Yalpi marja (Gross Margin)", f"{gross_margin:.1f}%", f"Me'yor: ≥ {100 - norms['max_cogs_pct']:.0f}%", gross_margin >= (100 - norms["max_cogs_pct"])),
-            ("Qaytarish (Vozvrat) ulushi", f"{return_rate:.1f}%", f"Me'yor: ≤ {norms['max_extra_pct']}%", return_rate <= norms["max_extra_pct"]),
-            ("O'rtacha sotuv narxi", fmt_money(avg_sale, curr), f"Jami {total_qty:,.0f} dona", True),
-            ("OPEX yuklamasi", f"{opex_pct:.1f}%", "Tushumga nisbatan", opex_pct <= 25),
-        ]
-        if return_rate > norms["max_extra_pct"]:
-            recs.append(("Ogohlantirish", "Tovar qaytarilishi", f"Vozvrat ulushi {return_rate:.1f}% ({total_extra:,.0f} dona).", "Eng ko'p qaytarilayotgan mahsulotlar sifatini va yetkazib beruvchisini tekshiring."))
-
-    # Umumiy P&L tavsiyalari
-    if not loss_items.empty:
-        loss_sum = abs(loss_items["Sof_foyda"].sum())
-        names = ", ".join(loss_items["item_name"].head(3).tolist())
-        recs.append(("Yuqori xavf", f"Zararli {cfg['item_label']}", f"Zararga ishlayotganlar: {names}. Jami zarar: {fmt_money(loss_sum, curr)}.", "Ushbu pozitsiyalarning narxini qayta ko'ring yoki to'xtatib, foydani darhol oshiring."))
-    if not anomalies.empty:
-        for _, r in anomalies.iterrows():
-            recs.append(("Ogohlantirish", "Xarajat anomaliyasi", f"{r['Oy']} oyida OPEX me'yordan keskin yuqori (Z={r['Z_score']:.2f}).", "O'sha oydagi barcha yirik xarajat moddalarini tekshiring."))
-    if len(group_df) > 1:
-        w, b = group_df.iloc[0], group_df.iloc[-1]
-        if b["Marja_%"] - w["Marja_%"] > 8:
-            recs.append(("Samaradorlik", cfg["group_label"], f"'{w['group_name']}' marjasi ({w['Marja_%']:.1f}%) yetakchi '{b['group_name']}' ({b['Marja_%']:.1f}%) dan past.", "Past samarali bo'limda xarajatlarni qisqartiring va yetakchi tajribasini qo'llang."))
-
-    # 6) QARZLAR TAHLILI (A/R & A/P)
-    debts_res = None
-    if not debts_df.empty:
-        ddf = debts_df.copy()
-        ddf["due_date"] = pd.to_datetime(ddf["due_date"], errors="coerce")
-        ddf = ddf.dropna(subset=["due_date"])
-        ddf["Kechikish_kuni"] = (ref_date - ddf["due_date"]).dt.days
-        ddf["Guruh"] = ddf["Kechikish_kuni"].apply(
-            lambda d: "Muddati kelmagan" if d <= 0 else ("1-30 kun" if d <= 30 else ("31-60 kun" if d <= 60 else ("61-90 kun" if d <= 90 else "90+ kun (Kritik)")))
-        )
-        ar = ddf[ddf["debt_type"] == "Debitor (Bizga qarz)"]
-        ap = ddf[ddf["debt_type"] == "Kreditor (Bizning qarz)"]
-        ar_over = ar[ar["Kechikish_kuni"] > 0]["amount"].sum()
-        ar_crit = ar[ar["Kechikish_kuni"] > 90]["amount"].sum()
-        ap_over = ap[ap["Kechikish_kuni"] > 0]["amount"].sum()
-        if ar_crit > 0:
-            recs.append(("Yuqori xavf", "Debitor qarz", f"90+ kun kechikkan kritik qarzlar: {fmt_money(ar_crit, curr)}.", "Nasiyani to'xtating va qarzni undirish bo'yicha rasmiy talabnoma yuboring."))
-        if ap_over > 0:
-            recs.append(("Ogohlantirish", "Kreditor qarz", f"Muddati o'tgan to'lovlarimiz: {fmt_money(ap_over, curr)}.", "Yetkazib beruvchilar bilan to'lov grafigini kelishib oling."))
-        debts_res = {
-            "df": ddf, "ar": ar, "ap": ap,
-            "ar_total": ar["amount"].sum(), "ar_over": ar_over, "ar_crit": ar_crit,
-            "ap_total": ap["amount"].sum(), "ap_over": ap_over,
-        }
-
-    # 7) OMBOR VA DEAD STOCK TAHLILI
-    inv_res = None
-    if cfg["uses_inventory"] and not inv_df.empty:
-        idf = inv_df.copy()
-        idf["last_sale_date"] = pd.to_datetime(idf["last_sale_date"], errors="coerce")
-        idf["Muzlatilgan_kapital"] = idf["qty"] * idf["unit_cost"]
-        idf["Sotilmagan_kun"] = (ref_date - idf["last_sale_date"]).dt.days.fillna(180).clip(lower=0)
-        daily_s = idf["monthly_sales"] / 30.0
-        idf["DIO_kun"] = np.where(daily_s > 0, idf["qty"] / daily_s, 999.0).round(0)
-        idf["Holat"] = idf.apply(
-            lambda r: "O'lik tovar (Dead Stock)" if (r["Sotilmagan_kun"] >= 90 or r["monthly_sales"] <= 0)
-            else ("Sekin aylanuvchi" if (r["Sotilmagan_kun"] >= 45 or r["DIO_kun"] > 120) else "Sog'lom zaxira"),
-            axis=1,
-        )
-        dead_df = idf[idf["Holat"] == "O'lik tovar (Dead Stock)"]
-        dead_val = dead_df["Muzlatilgan_kapital"].sum()
-        tot_inv = idf["Muzlatilgan_kapital"].sum()
-        if dead_val > 0:
-            recs.append(("Yuqori xavf", "O'lik tovarlar", f"Omborda {fmt_money(dead_val, curr)} ({dead_val/tot_inv*100:.1f}%) kapital muzlab yotibdi.", f"25% chegirma bilan sotsangiz kassaga darhol {fmt_money(dead_val*0.75, curr)} qaytadi."))
-        inv_res = {"df": idf.sort_values("Muzlatilgan_kapital", ascending=False), "dead_val": dead_val, "total_val": tot_inv, "dead_cnt": len(dead_df)}
-
-    # 8) CASH FLOW PROGNOZI (KASSA UZILISHI)
-    daily = df.groupby("tx_date", as_index=False).agg(Kirim=("revenue", "sum"), Tannarx=("cogs", "sum"), OPEX=("opex", "sum"))
-    daily["Chiqim"] = daily["Tannarx"] + daily["OPEX"]
-    avg_in = daily["Kirim"].mean()
-    avg_out = daily["Chiqim"].mean()
-
-    fut_dates = pd.date_range(ref_date + timedelta(days=1), periods=forecast_days, freq="D")
-    fc = pd.DataFrame({"Sana": fut_dates, "Kirim": avg_in, "Chiqim": avg_out})
-
-    if debts_res is not None:
-        ddf = debts_res["df"]
-        for _, r in ddf[(ddf["debt_type"] == "Debitor (Bizga qarz)") & (ddf["Kechikish_kuni"] <= 0)].iterrows():
-            fc.loc[fc["Sana"] == r["due_date"], "Kirim"] += r["amount"] * (ar_recovery_pct / 100.0)
-        for _, r in ddf[(ddf["debt_type"] == "Kreditor (Bizning qarz)") & (ddf["Kechikish_kuni"] <= 0)].iterrows():
-            fc.loc[fc["Sana"] == r["due_date"], "Chiqim"] += r["amount"]
-        if debts_res["ap_over"] > 0:
-            p_days = min(10, forecast_days)
-            fc.loc[: p_days - 1, "Chiqim"] += debts_res["ap_over"] / p_days
-        if debts_res["ar_over"] > 0 and ar_recovery_pct > 0:
-            s_i, e_i = min(7, forecast_days - 1), min(21, forecast_days - 1)
-            fc.loc[s_i:e_i, "Kirim"] += (debts_res["ar_over"] * (ar_recovery_pct / 100.0)) / max(1, e_i - s_i + 1)
-
-    fc["Sof_oqim"] = fc["Kirim"] - fc["Chiqim"]
-    fc["Balans"] = start_cash + fc["Sof_oqim"].cumsum()
-    gap_df = fc[fc["Balans"] < 0]
-    if not gap_df.empty:
-        recs.insert(0, ("Yuqori xavf", "Kassa uzilishi", f"{gap_df['Sana'].iloc[0].date()} dan boshlab {len(gap_df)} kun kassa manfiyga kiradi (min: {fmt_money(fc['Balans'].min(), curr)}).", "Debitor qarzni tezlashtiring, o'lik tovarlarni aksiyada soting yoki kreditor to'lovini kechiktiring."))
-
-    if not recs:
-        recs.append(("Barqaror", "Umumiy holat", "Kiritilgan ma'lumotlarda kritik zarar yoki xavf aniqlanmadi.", "A-toifadagi mahsulot/xizmatlarni kengaytirishda davom eting."))
-
-    res.update(
-        {
-            "df": df,
-            "kpi": {
-                "rev": total_rev, "cogs": total_cogs, "opex": total_opex,
-                "gross": gross_profit, "net": net_profit, "margin": net_margin,
-            },
-            "industry_kpis": industry_kpis,
-            "item_df": item_df,
-            "loss_items": loss_items,
-            "abc_df": abc_df,
-            "group_df": group_df,
-            "monthly_df": monthly_df,
-            "exp_df": exp_df,
-            "debts": debts_res,
-            "inventory": inv_res,
-            "cf": {"fc": fc, "gap": gap_df, "min_bal": fc["Balans"].min(), "end_bal": fc["Balans"].iloc[-1]},
-            "recs": recs,
-        }
-    )
+def load_profile(company_id: int) -> dict:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM company_profile WHERE company_id = ?", (int(company_id),)).fetchone()
+    conn.close()
+    res = dict(DEFAULT_PROFILE)
+    if row is not None:
+        for k in DEFAULT_PROFILE:
+            if k in row.keys() and row[k] is not None:
+                res[k] = row[k]
     return res
 
 
-# ---------------------------------------------------------
-# 5. ILOVANI ISHGA TUSHIRISH VA SIDEBAR (KORXONA BOSHQARUVI)
-# ---------------------------------------------------------
-init_db()
-companies = get_companies()
-
-st.sidebar.title("🏢 Korxonalar Boshqaruvi")
-
-with st.sidebar.expander("➕ Yangi korxona qo'shish", expanded=(len(companies) == 0)):
-    with st.form("new_company_form", clear_on_submit=True):
-        c_name = st.text_input("Korxona nomi *", placeholder="Masalan: Baraka Savdo MChJ")
-        c_ind = st.selectbox("Faoliyat turi *", list(INDUSTRY_CONFIG.keys()))
-        c_curr = st.selectbox("Asosiy valyuta", ["UZS", "USD", "EUR"])
-        c_cash = st.number_input("Hozirgi kassa qoldig'i", min_value=0.0, value=0.0, step=1_000_000.0)
-        if st.form_submit_button("Korxonani yaratish", type="primary", use_container_width=True):
-            if not c_name.strip():
-                st.error("Korxona nomini kiriting.")
-            else:
-                ok, msg = create_company(c_name, c_ind, c_curr, c_cash)
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-if not companies:
-    st.title("🏢 Universal Biznes Analitika Platformasi")
-    st.info(
-        "Platformada hech qanday oldindan yozilgan soxta ma'lumot yo'q. "
-        "Ishni boshlash uchun **chap paneldan yangi korxona yarating** va uning faoliyat turini tanlang. "
-        "Shundan so'ng barcha savdo, xarajat, qarz va ombor ma'lumotlarini to'g'ridan-to'g'ri sayt ichida kiritishingiz mumkin."
+def save_profile(company_id: int, data: dict):
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO company_profile (
+            company_id, davr_kun, jami_mijozlar, yangi_mijozlar, qayta_mijozlar,
+            reklama_xarajati, mijoz_davomiyligi_oy, top3_mijoz_ulushi,
+            xodimlar_soni, oylik_fondi, ketgan_xodimlar, reja_bajarilishi,
+            brak_qaytarilish, bajarilish_vaqti_kun, quvvat_bandligi, asosiy_yetkazuvchi_ulushi
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(company_id) DO UPDATE SET
+            davr_kun=excluded.davr_kun,
+            jami_mijozlar=excluded.jami_mijozlar,
+            yangi_mijozlar=excluded.yangi_mijozlar,
+            qayta_mijozlar=excluded.qayta_mijozlar,
+            reklama_xarajati=excluded.reklama_xarajati,
+            mijoz_davomiyligi_oy=excluded.mijoz_davomiyligi_oy,
+            top3_mijoz_ulushi=excluded.top3_mijoz_ulushi,
+            xodimlar_soni=excluded.xodimlar_soni,
+            oylik_fondi=excluded.oylik_fondi,
+            ketgan_xodimlar=excluded.ketgan_xodimlar,
+            reja_bajarilishi=excluded.reja_bajarilishi,
+            brak_qaytarilish=excluded.brak_qaytarilish,
+            bajarilish_vaqti_kun=excluded.bajarilish_vaqti_kun,
+            quvvat_bandligi=excluded.quvvat_bandligi,
+            asosiy_yetkazuvchi_ulushi=excluded.asosiy_yetkazuvchi_ulushi
+        """,
+        (
+            int(company_id),
+            int(data["davr_kun"]),
+            int(data["jami_mijozlar"]),
+            int(data["yangi_mijozlar"]),
+            int(data["qayta_mijozlar"]),
+            float(data["reklama_xarajati"]),
+            float(data["mijoz_davomiyligi_oy"]),
+            float(data["top3_mijoz_ulushi"]),
+            int(data["xodimlar_soni"]),
+            float(data["oylik_fondi"]),
+            int(data["ketgan_xodimlar"]),
+            float(data["reja_bajarilishi"]),
+            float(data["brak_qaytarilish"]),
+            float(data["bajarilish_vaqti_kun"]),
+            float(data["quvvat_bandligi"]),
+            float(data["asosiy_yetkazuvchi_ulushi"]),
+        ),
     )
-    st.stop()
+    conn.commit()
+    conn.close()
 
-# Faol korxonani tanlash
-comp_map = {f"{c['name']} ({c['industry'].split(' ')[0]})": c for c in companies}
-selected_label = st.sidebar.selectbox("Faol korxonani tanlang", list(comp_map.keys()))
-company = comp_map[selected_label]
-cid = company["id"]
-curr = company["currency"]
-industry = company["industry"]
-cfg = INDUSTRY_CONFIG[industry]
-
-st.sidebar.caption(f"📌 Faoliyat turi: **{industry}**")
-
-# Kassa va prognoz sozlamalari
-st.sidebar.divider()
-st.sidebar.subheader("💵 Cash Flow Sozlamalari")
-new_cash = st.sidebar.number_input(
-    f"Kassa qoldig'i ({curr})", min_value=0.0, value=float(company["start_cash"]), step=1_000_000.0
-)
-if new_cash != float(company["start_cash"]):
-    update_company_cash(cid, new_cash)
-    company["start_cash"] = new_cash
-
-forecast_days = st.sidebar.slider("Prognoz davri (kun)", 15, 90, 45, step=15)
-ar_recovery = st.sidebar.slider("Debitor qaytish ehtimoli (%)", 0, 100, 60, step=5)
-
-# Bo'sh shablon yuklab olish
-st.sidebar.divider()
-st.sidebar.download_button(
-    label="📥 Ushbu soha uchun bo'sh Excel shablon",
-    data=build_empty_template_excel(cfg),
-    file_name=f"{company['name'].replace(' ', '_')}_shablon.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
-
-with st.sidebar.expander("🗑️ Korxonani o'chirish"):
-    st.warning("Bu amal korxonaning bazadagi barcha yozuvlarini o'chiradi.")
-    if st.button("Ha, butunlay o'chirish", type="secondary", use_container_width=True):
-        delete_company(cid)
-        st.rerun()
-
-# Bazadan joriy korxona ma'lumotlarini yuklash
-tx_df = load_table("transactions", cid)
-debts_df = load_table("debts", cid)
-inv_df = load_table("inventory", cid)
-
-# Tahlilni hisoblash
-analysis = analyze_company(
-    tx_df, debts_df, inv_df, industry, cfg, float(company["start_cash"]), forecast_days, float(ar_recovery), curr
-)
-
-# ---------------------------------------------------------
-# 6. ASOSIY INTERFEYS VA TABLAR
-# ---------------------------------------------------------
-st.title(f"🏢 {company['name']}")
-st.caption(f"Faoliyat turi: **{industry}** | Valyuta: **{curr}** | Bazadagi operatsiyalar: **{len(tx_df)} ta**")
-
-tab_titles = [
-    "✍️ Ma'lumot Kiritish",
-    "🏭 Soha Tahlili & P&L",
-    "💵 Cash Flow & Qarzlar",
-]
-if cfg["uses_inventory"]:
-    tab_titles.append("📦 Ombor & Dead Stock")
-tab_titles.append("🎯 Diagnostika & Simulyator")
-
-tabs = st.tabs(tab_titles)
-tab_idx = 0
 
 # =========================================================
-# TAB 1: MA'LUMOT KIRITISH (FORMA + JADVAL MUHARRIRI + EXCEL)
+# 3. XATOSIZ TOZALASH VA YORDAMCHI FUNKSIYALAR
 # =========================================================
-with tabs[tab_idx]:
-    sub_tabs = ["📝 Operatsiya kiritish", "🧾 Qarzlar kiritish"]
-    if cfg["uses_inventory"]:
-        sub_tabs.append("📦 Ombor kiritish")
-    sub_tabs.append("📤 Excel / CSV import")
-    in_tabs = st.tabs(sub_tabs)
+def _clean_text(val, default: str = "Umumiy") -> str:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return default
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return default
+    return s
 
-    # 1A: Operatsiyalar (Forma + Jonli jadval)
-    with in_tabs[0]:
-        st.subheader(f"Yangi yozuv qo'shish ({industry})")
-        with st.form("add_tx_form", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns(4)
-            f_date = c1.date_input("Sana *", value=date.today())
-            f_group = c2.text_input(f"{cfg['group_label']} *", value="Asosiy")
-            f_item = c3.text_input(f"{cfg['item_label']} *")
-            f_exp = c4.selectbox("Asosiy xarajat turi", cfg["expenses"])
 
-            c5, c6, c7, c8, c9 = st.columns(5)
-            f_qty = c5.number_input(cfg["qty_label"], min_value=0.0, value=1.0, step=1.0)
-            f_rev = c6.number_input(f"Tushum ({curr})", min_value=0.0, value=0.0, step=100_000.0)
-            f_cogs = c7.number_input(f"{cfg['cogs_label']}", min_value=0.0, value=0.0, step=100_000.0)
-            f_opex = c8.number_input(f"OPEX ({curr})", min_value=0.0, value=0.0, step=50_000.0)
-            f_extra = c9.number_input(cfg["extra_label"], min_value=0.0, value=0.0, step=1.0)
-            f_note = st.text_input("Izoh (ixtiyoriy)")
+def _clean_num(val, default: float = 0.0) -> float:
+    if val is None:
+        return float(default)
+    if isinstance(val, (int, float, np.number)):
+        if np.isnan(val) or np.isinf(val):
+            return float(default)
+        return float(val)
+    s = str(val).strip().replace(" ", "").replace(",", ".")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    try:
+        return float(s) if s else float(default)
+    except Exception:
+        return float(default)
 
-            if st.form_submit_button("➕ Bazaga qo'shish", type="primary"):
-                if not f_item.strip():
-                    st.error(f"Iltimos, '{cfg['item_label']}' nomini kiriting.")
-                else:
-                    insert_transaction(
-                        cid,
-                        {
-                            "tx_date": f_date, "group_name": f_group, "item_name": f_item,
-                            "expense_type": f_exp, "quantity": f_qty, "revenue": f_rev,
-                            "cogs": f_cogs, "opex": f_opex, "extra_metric": f_extra, "notes": f_note,
-                        },
-                    )
-                    st.success("Yozuv bazaga saqlandi!")
-                    st.rerun()
 
-        st.divider()
-        st.subheader("✏️ Jadval ko'rinishida tahrirlash (Excel kabi qator qo'shish / o'chirish)")
-        edit_tx = tx_df[["tx_date", "group_name", "item_name", "expense_type", "quantity", "revenue", "cogs", "opex", "extra_metric", "notes"]].copy() if not tx_df.empty else pd.DataFrame(
-            columns=["tx_date", "group_name", "item_name", "expense_type", "quantity", "revenue", "cogs", "opex", "extra_metric", "notes"]
-        )
-        edit_tx["tx_date"] = pd.to_datetime(edit_tx["tx_date"], errors="coerce").dt.date
+def _clean_date_str(val) -> str:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return date.today().strftime("%Y-%m-%d")
+    if isinstance(val, (datetime, date, pd.Timestamp)):
+        try:
+            if pd.isna(val):
+                return date.today().strftime("%Y-%m-%d")
+            return val.strftime("%Y-%m-%d")
+        except Exception:
+            return date.today().strftime("%Y-%m-%d")
+    parsed = pd.to_datetime(str(val).strip(), errors="coerce")
+    if pd.isna(parsed):
+        return date.today().strftime("%Y-%m-%d")
+    return parsed.strftime("%Y-%m-%d")
 
-        edited_tx = st.data_editor(
-            edit_tx,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "tx_date": st.column_config.DateColumn("Sana", default=date.today()),
-                "group_name": st.column_config.TextColumn(cfg["group_label"], default="Asosiy"),
-                "item_name": st.column_config.TextColumn(cfg["item_label"]),
-                "expense_type": st.column_config.SelectboxColumn("Xarajat turi", options=cfg["expenses"], default=cfg["expenses"][0]),
-                "quantity": st.column_config.NumberColumn(cfg["qty_label"], min_value=0, default=1),
-                "revenue": st.column_config.NumberColumn(f"Tushum ({curr})", min_value=0, default=0),
-                "cogs": st.column_config.NumberColumn(cfg["cogs_label"], min_value=0, default=0),
-                "opex": st.column_config.NumberColumn("OPEX", min_value=0, default=0),
-                "extra_metric": st.column_config.NumberColumn(cfg["extra_label"], min_value=0, default=0),
-                "notes": st.column_config.TextColumn("Izoh"),
-            },
-            key="tx_editor",
-        )
-        if st.button("💾 Operatsiyalar jadvalini bazaga saqlash", type="primary"):
-            replace_transactions(cid, edited_tx)
-            st.success("Barcha o'zgarishlar saqlandi!")
-            st.rerun()
 
-    # 1B: Qarzlar kiritish
-    with in_tabs[1]:
-        st.subheader("Debitor (bizga qarz) va Kreditor (bizning qarz) kiritish")
-        with st.form("add_debt_form", clear_on_submit=True):
-            d1, d2, d3, d4 = st.columns(4)
-            d_part = d1.text_input("Kontragent (Mijoz / Yetkazuvchi) *")
-            d_type = d2.selectbox("Qarz turi", ["Debitor (Bizga qarz)", "Kreditor (Bizning qarz)"])
-            d_due = d3.date_input("To'lov muddati", value=date.today())
-            d_amt = d4.number_input(f"Qoldiq summa ({curr})", min_value=0.0, step=100_000.0)
-            d_note = st.text_input("Izoh", key="debt_note")
-            if st.form_submit_button("➕ Qarzni qo'shish", type="primary"):
-                if not d_part.strip():
-                    st.error("Kontragent nomini kiriting.")
-                else:
-                    insert_debt(cid, {"partner": d_part, "debt_type": d_type, "due_date": d_due, "amount": d_amt, "notes": d_note})
-                    st.success("Qarz yozuvi saqlandi!")
-                    st.rerun()
+def _normalize_debt_type(val) -> str:
+    s = _clean_text(val, "Bizga qarzdor").lower()
+    if any(k in s for k in ("kred", "cred", "bizning", "berish", "yetkaz")):
+        return "Bizning qarzimiz"
+    return "Bizga qarzdor"
 
-        edit_d = debts_df[["partner", "debt_type", "due_date", "amount", "notes"]].copy() if not debts_df.empty else pd.DataFrame(
-            columns=["partner", "debt_type", "due_date", "amount", "notes"]
-        )
-        edit_d["due_date"] = pd.to_datetime(edit_d["due_date"], errors="coerce").dt.date
-        edited_d = st.data_editor(
-            edit_d,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "partner": st.column_config.TextColumn("Kontragent"),
-                "debt_type": st.column_config.SelectboxColumn("Tur", options=["Debitor (Bizga qarz)", "Kreditor (Bizning qarz)"]),
-                "due_date": st.column_config.DateColumn("To'lov muddati", default=date.today()),
-                "amount": st.column_config.NumberColumn(f"Summa ({curr})", min_value=0),
-                "notes": st.column_config.TextColumn("Izoh"),
-            },
-            key="debt_editor",
-        )
-        if st.button("💾 Qarzlar jadvalini saqlash"):
-            replace_debts(cid, edited_d)
-            st.success("Qarzlar yangilandi!")
-            st.rerun()
 
-    # 1C: Ombor kiritish (agar sohaga tegishli bo'lsa)
-    next_sub = 2
-    if cfg["uses_inventory"]:
-        with in_tabs[next_sub]:
-            st.subheader("Ombor zaxiralari va o'lik tovarlarni kiritish")
-            with st.form("add_inv_form", clear_on_submit=True):
-                i1, i2, i3 = st.columns(3)
-                i_item = i1.text_input("Mahsulot / Material nomi *")
-                i_wh = i2.text_input("Ombor", value="Asosiy ombor")
-                i_qty = i3.number_input("Qoldiq soni", min_value=0.0, value=1.0)
-                i4, i5, i6 = st.columns(3)
-                i_cost = i4.number_input(f"Birlik tannarxi ({curr})", min_value=0.0, step=10_000.0)
-                i_last = i5.date_input("Oxirgi sotuv / harakat sanasi", value=date.today())
-                i_mon = i6.number_input("Oylik o'rtacha sotuv/sarf soni", min_value=0.0, value=1.0)
-                if st.form_submit_button("➕ Omborga qo'shish", type="primary"):
-                    if not i_item.strip():
-                        st.error("Mahsulot nomini kiriting.")
-                    else:
-                        insert_inventory(cid, {"item_name": i_item, "warehouse": i_wh, "qty": i_qty, "unit_cost": i_cost, "last_sale_date": i_last, "monthly_sales": i_mon})
-                        st.success("Ombor yozuvi saqlandi!")
-                        st.rerun()
+def _normalize_debt_status(val, due_date_str: str) -> str:
+    s = _clean_text(val, "").lower()
+    if "to'lan" in s or "yopil" in s or "paid" in s:
+        return "To'langan"
+    if "kechik" in s or "over" in s:
+        return "Kechikkan"
+    try:
+        d = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+        if d < date.today():
+            return "Kechikkan"
+    except Exception:
+        pass
+    return "Muddatida"
 
-            edit_i = inv_df[["item_name", "warehouse", "qty", "unit_cost", "last_sale_date", "monthly_sales"]].copy() if not inv_df.empty else pd.DataFrame(
-                columns=["item_name", "warehouse", "qty", "unit_cost", "last_sale_date", "monthly_sales"]
-            )
-            edit_i["last_sale_date"] = pd.to_datetime(edit_i["last_sale_date"], errors="coerce").dt.date
-            edited_i = st.data_editor(
-                edit_i,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "item_name": st.column_config.TextColumn("Mahsulot"),
-                    "warehouse": st.column_config.TextColumn("Ombor", default="Asosiy ombor"),
-                    "qty": st.column_config.NumberColumn("Qoldiq soni", min_value=0),
-                    "unit_cost": st.column_config.NumberColumn("Birlik tannarxi", min_value=0),
-                    "last_sale_date": st.column_config.DateColumn("Oxirgi harakat", default=date.today()),
-                    "monthly_sales": st.column_config.NumberColumn("Oylik o'rtacha sarf", min_value=0),
-                },
-                key="inv_editor",
-            )
-            if st.button("💾 Ombor jadvalini saqlash"):
-                replace_inventory(cid, edited_i)
-                st.success("Ombor yangilandi!")
-                st.rerun()
-        next_sub += 1
 
-    # 1D: Excel / CSV orqali ommaviy yuklash
-    with in_tabs[next_sub]:
-        st.subheader("Tayyor Excel yoki CSV fayldan bazaga ommaviy import qilish")
-        st.caption("Chap paneldan ushbu soha uchun bo'sh Excel shablonni yuklab olib to'ldirishingiz yoki o'zingizdagi faylni yuklab ustunlarni bog'lashingiz mumkin.")
-        up_file = st.file_uploader("Operatsiyalar faylini tanlang (.xlsx / .csv)", type=["xlsx", "xls", "csv"])
-        if up_file is not None:
-            up_df = pd.read_csv(up_file) if up_file.name.lower().endswith(".csv") else pd.read_excel(up_file)
-            st.write(f"Yuklangan fayl: **{len(up_df)} qator**", up_df.head(5))
-            ucols = list(up_df.columns)
-            opt_u = ["Yo'q"] + ucols
-            m1, m2, m3, m4 = st.columns(4)
-            mc_date = m1.selectbox("Sana ustuni *", ucols)
-            mc_item = m2.selectbox(f"{cfg['item_label']} *", ucols)
-            mc_rev = m3.selectbox("Tushum *", ucols)
-            mc_group = m4.selectbox(cfg["group_label"], opt_u)
+def fmt_pul(val: float, curr: str = "so'm") -> str:
+    try:
+        return f"{float(val):,.0f} {curr}".replace(",", " ")
+    except Exception:
+        return f"0 {curr}"
 
-            m5, m6, m7, m8, m9 = st.columns(5)
-            mc_cogs = m5.selectbox(cfg["cogs_label"], opt_u)
-            mc_opex = m6.selectbox("OPEX", opt_u)
-            mc_qty = m7.selectbox(cfg["qty_label"], opt_u)
-            mc_exp = m8.selectbox("Xarajat turi", opt_u)
-            mc_ext = m9.selectbox(cfg["extra_label"], opt_u)
 
-            if st.button("📥 Bazaga qo'shish (Import)", type="primary"):
-                added = 0
-                for _, r in up_df.iterrows():
-                    dt = pd.to_datetime(r[mc_date], errors="coerce")
-                    if pd.isna(dt):
-                        continue
-                    insert_transaction(
-                        cid,
-                        {
-                            "tx_date": dt.strftime("%Y-%m-%d"),
-                            "group_name": str(r[mc_group]) if mc_group != "Yo'q" else "Asosiy",
-                            "item_name": str(r[mc_item]),
-                            "expense_type": str(r[mc_exp]) if mc_exp != "Yo'q" else cfg["expenses"][0],
-                            "quantity": float(pd.to_numeric(r[mc_qty], errors="coerce") or 1) if mc_qty != "Yo'q" else 1.0,
-                            "revenue": float(pd.to_numeric(r[mc_rev], errors="coerce") or 0),
-                            "cogs": float(pd.to_numeric(r[mc_cogs], errors="coerce") or 0) if mc_cogs != "Yo'q" else 0.0,
-                            "opex": float(pd.to_numeric(r[mc_opex], errors="coerce") or 0) if mc_opex != "Yo'q" else 0.0,
-                            "extra_metric": float(pd.to_numeric(r[mc_ext], errors="coerce") or 0) if mc_ext != "Yo'q" else 0.0,
-                            "notes": "Excel import",
-                        },
-                    )
-                    added += 1
-                st.success(f"{added} ta operatsiya bazaga muvaffaqiyatli qo'shildi!")
-                st.rerun()
+def clamp(val: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return float(max(lo, min(hi, val)))
 
-tab_idx += 1
+
+def load_demo_data(company_id: int):
+    """Birinchi kirgan odam 1 tugma bilan tizimni sinab ko'rishi uchun tayyor namuna ma'lumotlar."""
+    today = date.today()
+    tx_rows = [
+        ((today - timedelta(days=28)).strftime("%Y-%m-%d"), "Noutbuklar", "Lenovo IdeaPad 3", 3, 21_600_000, 17_400_000, 950_000),
+        ((today - timedelta(days=26)).strftime("%Y-%m-%d"), "Smartfonlar", "Samsung Galaxy A55", 5, 22_500_000, 18_500_000, 800_000),
+        ((today - timedelta(days=24)).strftime("%Y-%m-%d"), "Aksessuarlar", "Sichqoncha va Klaviatura", 18, 4_500_000, 2_700_000, 300_000),
+        ((today - timedelta(days=21)).strftime("%Y-%m-%d"), "Monitorlar", "Dell 24 Monitor", 4, 9_600_000, 7_600_000, 450_000),
+        ((today - timedelta(days=18)).strftime("%Y-%m-%d"), "Noutbuklar", "HP Pavilion 15", 2, 16_400_000, 13_600_000, 700_000),
+        ((today - timedelta(days=15)).strftime("%Y-%m-%d"), "Smartfonlar", "Redmi Note 13 Pro", 6, 19_800_000, 16_200_000, 650_000),
+        ((today - timedelta(days=13)).strftime("%Y-%m-%d"), "Printerlar", "HP LaserJet M111w", 2, 4_800_000, 4_600_000, 500_000),
+        ((today - timedelta(days=10)).strftime("%Y-%m-%d"), "Noutbuklar", "Lenovo IdeaPad 3", 4, 28_800_000, 23_200_000, 1_100_000),
+        ((today - timedelta(days=8)).strftime("%Y-%m-%d"), "Smartfonlar", "Samsung Galaxy A55", 4, 18_000_000, 14_800_000, 650_000),
+        ((today - timedelta(days=5)).strftime("%Y-%m-%d"), "Printerlar", "Epson Rangli Printer", 1, 2_950_000, 2_850_000, 350_000),
+        ((today - timedelta(days=3)).strftime("%Y-%m-%d"), "Monitorlar", "Dell 24 Monitor", 3, 7_200_000, 5_700_000, 320_000),
+        ((today - timedelta(days=1)).strftime("%Y-%m-%d"), "Aksessuarlar", "USB Fleshka 64GB", 30, 3_000_000, 1_800_000, 180_000),
+    ]
+    tx_df = pd.DataFrame(tx_rows, columns=["tx_date", "category", "item_name", "qty", "revenue", "cogs", "opex"])
+
+    debt_rows = [
+        ("MegaSavdo MChJ", "Bizga qarzdor", 18_500_000, (today - timedelta(days=14)).strftime("%Y-%m-%d"), "Kechikkan"),
+        ("Samarqand Ofis Servis", "Bizga qarzdor", 9_200_000, (today + timedelta(days=12)).strftime("%Y-%m-%d"), "Muddatida"),
+        ("Aloqa Savdo Markazi", "Bizga qarzdor", 7_400_000, (today - timedelta(days=25)).strftime("%Y-%m-%d"), "Kechikkan"),
+        ("TexnoImport Ulgurji", "Bizning qarzimiz", 21_000_000, (today + timedelta(days=8)).strftime("%Y-%m-%d"), "Muddatida"),
+        ("Tezkor Logistika", "Bizning qarzimiz", 4_800_000, (today - timedelta(days=5)).strftime("%Y-%m-%d"), "Kechikkan"),
+    ]
+    debts_df = pd.DataFrame(debt_rows, columns=["counterparty", "debt_type", "amount", "due_date", "status"])
+
+    inv_rows = [
+        ("Lenovo IdeaPad 3", "Noutbuklar", 7, 5_800_000, (today - timedelta(days=10)).strftime("%Y-%m-%d")),
+        ("Samsung Galaxy A55", "Smartfonlar", 11, 3_700_000, (today - timedelta(days=8)).strftime("%Y-%m-%d")),
+        ("Dell 24 Monitor", "Monitorlar", 6, 1_900_000, (today - timedelta(days=3)).strftime("%Y-%m-%d")),
+        ("Eski VGA Kabel 3m", "Aksessuarlar", 45, 35_000, (today - timedelta(days=140)).strftime("%Y-%m-%d")),
+        ("Eski Planshet G'ilofi", "Aksessuarlar", 32, 65_000, (today - timedelta(days=165)).strftime("%Y-%m-%d")),
+    ]
+    inv_df = pd.DataFrame(inv_rows, columns=["item_name", "category", "qty", "unit_cost", "last_sale_date"])
+
+    replace_transactions(company_id, tx_df)
+    replace_debts(company_id, debts_df)
+    replace_inventory(company_id, inv_df)
+    update_company_cash(company_id, 45_000_000.0)
+    save_profile(company_id, {
+        **DEFAULT_PROFILE,
+        "top3_mijoz_ulushi": 52.0,
+        "brak_qaytarilish": 4.5,
+        "oylik_fondi": 44_000_000.0,
+    })
+
 
 # =========================================================
-# TAB 2: SOHA TAHLILI VA P&L
+# 4. EXCEL SHABLON YARATISH VA XATOSIZ YUKLASH
 # =========================================================
-with tabs[tab_idx]:
-    if not analysis["has_tx"]:
-        st.info("Tahlil va grafiklar shakllanishi uchun avval **'✍️ Ma'lumot Kiritish'** bo'limidan kamida 1 ta operatsiya kiriting.")
+def build_excel_template() -> bytes:
+    today = date.today()
+    ops_df = pd.DataFrame([
+        {
+            "Sana": today.strftime("%Y-%m-%d"),
+            "Bo'lim": "Noutbuklar",
+            "Mahsulot nomi": "Lenovo IdeaPad 3",
+            "Miqdor": 2,
+            "Tushum": 14400000,
+            "Tannarx": 11600000,
+            "Boshqa xarajat": 600000,
+        },
+        {
+            "Sana": (today - timedelta(days=2)).strftime("%Y-%m-%d"),
+            "Bo'lim": "Aksessuarlar",
+            "Mahsulot nomi": "Sichqoncha",
+            "Miqdor": 10,
+            "Tushum": 1800000,
+            "Tannarx": 1100000,
+            "Boshqa xarajat": 120000,
+        },
+    ])
+    debts_df = pd.DataFrame([
+        {
+            "Hamkor nomi": "Baraka Savdo MChJ",
+            "Qarz turi": "Bizga qarzdor",
+            "Summa": 12000000,
+            "To'lov muddati": (today + timedelta(days=15)).strftime("%Y-%m-%d"),
+            "Holati": "Muddatida",
+        }
+    ])
+    inv_df = pd.DataFrame([
+        {
+            "Mahsulot nomi": "Lenovo IdeaPad 3",
+            "Bo'lim": "Noutbuklar",
+            "Qoldiq soni": 5,
+            "Birlik tannarxi": 5800000,
+            "Oxirgi sotilgan sana": today.strftime("%Y-%m-%d"),
+        }
+    ])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        ops_df.to_excel(writer, sheet_name="Savdo", index=False)
+        debts_df.to_excel(writer, sheet_name="Qarzlar", index=False)
+        inv_df.to_excel(writer, sheet_name="Ombor", index=False)
+    return buf.getvalue()
+
+
+def _find_col(df: pd.DataFrame, aliases: list):
+    cols = {str(c).lower().strip(): c for c in df.columns}
+    for a in aliases:
+        if a.lower() in cols:
+            return cols[a.lower()]
+    for a in aliases:
+        al = a.lower()
+        for k, orig in cols.items():
+            if al in k:
+                return orig
+    return None
+
+
+def parse_uploaded_excel(file_bytes: bytes) -> dict:
+    """Har qanday Excel faylini bo'sh qatorlar va NaN lardan tozalab xatosiz o'qiydi."""
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet_names = xls.sheet_names
+    result = {"tx": pd.DataFrame(), "debts": pd.DataFrame(), "inv": pd.DataFrame(), "messages": []}
+
+    tx_sheet = None
+    debt_sheet = None
+    inv_sheet = None
+
+    for s in sheet_names:
+        sl = s.lower()
+        if any(k in sl for k in ("savdo", "operat", "trans", "sotuv", "data")):
+            tx_sheet = tx_sheet or s
+        elif any(k in sl for k in ("qarz", "debt")):
+            debt_sheet = debt_sheet or s
+        elif any(k in sl for k in ("ombor", "inv", "zaxira", "sklad")):
+            inv_sheet = inv_sheet or s
+
+    if tx_sheet is None and len(sheet_names) >= 1:
+        tx_sheet = sheet_names[0]
+
+    # 1. Savdo varag'ini o'qish
+    if tx_sheet:
+        raw = pd.read_excel(xls, sheet_name=tx_sheet).dropna(how="all")
+        if not raw.empty:
+            c_date = _find_col(raw, ["sana", "date", "tx_date"])
+            c_cat = _find_col(raw, ["bo'lim", "guruh", "category", "filial", "tur"])
+            c_item = _find_col(raw, ["mahsulot nomi", "mahsulot", "item_name", "sku", "nomi", "product"])
+            c_qty = _find_col(raw, ["miqdor", "soni", "qty", "sotilgan"])
+            c_rev = _find_col(raw, ["tushum", "savdo", "revenue", "summa"])
+            c_cogs = _find_col(raw, ["tannarx", "cogs", "xarid"])
+            c_opex = _find_col(raw, ["boshqa xarajat", "operatsion xarajat", "opex", "xarajat"])
+
+            rows = []
+            for _, r in raw.iterrows():
+                rev_v = _clean_num(r[c_rev], 0.0) if c_rev else 0.0
+                cogs_v = _clean_num(r[c_cogs], 0.0) if c_cogs else 0.0
+                opex_v = _clean_num(r[c_opex], 0.0) if c_opex else 0.0
+                item_v = _clean_text(r[c_item], "") if c_item else ""
+                if not item_v and rev_v == 0 and cogs_v == 0 and opex_v == 0:
+                    continue
+                if item_v.lower() in ("jami", "itogo", "total", "всего"):
+                    continue
+                rows.append({
+                    "tx_date": _clean_date_str(r[c_date]) if c_date else date.today().strftime("%Y-%m-%d"),
+                    "category": _clean_text(r[c_cat], "Umumiy") if c_cat else "Umumiy",
+                    "item_name": item_v or "Nomsiz mahsulot",
+                    "qty": max(_clean_num(r[c_qty], 1.0), 0.0) if c_qty else 1.0,
+                    "revenue": rev_v,
+                    "cogs": cogs_v,
+                    "opex": opex_v,
+                })
+            if rows:
+                result["tx"] = pd.DataFrame(rows)
+                result["messages"].append(f"'{tx_sheet}' varag'idan {len(rows)} ta savdo qatori o'qildi.")
+
+    # 2. Qarzlar varag'i
+    if debt_sheet:
+        raw_d = pd.read_excel(xls, sheet_name=debt_sheet).dropna(how="all")
+        if not raw_d.empty:
+            c_cp = _find_col(raw_d, ["hamkor", "kontragent", "mijoz", "counterparty", "nomi"])
+            c_type = _find_col(raw_d, ["qarz turi", "turi", "type", "debt_type"])
+            c_amt = _find_col(raw_d, ["summa", "amount", "qoldiq"])
+            c_due = _find_col(raw_d, ["muddat", "due", "sana"])
+            c_st = _find_col(raw_d, ["holat", "status"])
+            d_rows = []
+            for _, r in raw_d.iterrows():
+                amt_v = _clean_num(r[c_amt], 0.0) if c_amt else 0.0
+                cp_v = _clean_text(r[c_cp], "") if c_cp else ""
+                if not cp_v and amt_v == 0:
+                    continue
+                due_s = _clean_date_str(r[c_due]) if c_due else date.today().strftime("%Y-%m-%d")
+                d_rows.append({
+                    "counterparty": cp_v or "Noma'lum hamkor",
+                    "debt_type": _normalize_debt_type(r[c_type]) if c_type else "Bizga qarzdor",
+                    "amount": amt_v,
+                    "due_date": due_s,
+                    "status": _normalize_debt_status(r[c_st] if c_st else "", due_s),
+                })
+            if d_rows:
+                result["debts"] = pd.DataFrame(d_rows)
+                result["messages"].append(f"'{debt_sheet}' varag'idan {len(d_rows)} ta qarz qatori o'qildi.")
+
+    # 3. Ombor varag'i
+    if inv_sheet:
+        raw_i = pd.read_excel(xls, sheet_name=inv_sheet).dropna(how="all")
+        if not raw_i.empty:
+            c_item = _find_col(raw_i, ["mahsulot", "item", "tovar", "nomi"])
+            c_cat = _find_col(raw_i, ["bo'lim", "guruh", "category"])
+            c_qty = _find_col(raw_i, ["qoldiq", "miqdor", "soni", "qty"])
+            c_cost = _find_col(raw_i, ["tannarx", "narx", "cost"])
+            c_last = _find_col(raw_i, ["oxirgi", "sana", "last_sale"])
+            i_rows = []
+            for _, r in raw_i.iterrows():
+                item_v = _clean_text(r[c_item], "") if c_item else ""
+                qty_v = _clean_num(r[c_qty], 0.0) if c_qty else 0.0
+                if not item_v and qty_v == 0:
+                    continue
+                i_rows.append({
+                    "item_name": item_v or "Nomsiz tovar",
+                    "category": _clean_text(r[c_cat], "Umumiy") if c_cat else "Umumiy",
+                    "qty": qty_v,
+                    "unit_cost": _clean_num(r[c_cost], 0.0) if c_cost else 0.0,
+                    "last_sale_date": _clean_date_str(r[c_last]) if c_last else date.today().strftime("%Y-%m-%d"),
+                })
+            if i_rows:
+                result["inv"] = pd.DataFrame(i_rows)
+                result["messages"].append(f"'{inv_sheet}' varag'idan {len(i_rows)} ta ombor qatori o'qildi.")
+
+    return result
+
+
+# =========================================================
+# 5. YAGONA TAHLIL DVIGATELI (100% O'ZBEKCHA VA TUSHUNARLI)
+# =========================================================
+def compute_full_analysis(company: dict, tx_df: pd.DataFrame, debts_df: pd.DataFrame, inv_df: pd.DataFrame, prof: dict) -> dict:
+    sector_norm = SOHALAR.get(company["sector"], SOHALAR["Savdo (Do'kon / Ulgurji)"])
+    days = max(int(prof["davr_kun"]), 1)
+
+    # --- 1. Foyda va Zarar ---
+    if tx_df is not None and not tx_df.empty:
+        tdf = tx_df.copy()
+        for c in ("qty", "revenue", "cogs", "opex"):
+            tdf[c] = pd.to_numeric(tdf[c], errors="coerce").fillna(0.0)
+        tdf["foyda"] = tdf["revenue"] - tdf["cogs"] - tdf["opex"]
+        rev = float(tdf["revenue"].sum())
+        cogs = float(tdf["cogs"].sum())
+        opex = float(tdf["opex"].sum())
     else:
-        kpi = analysis["kpi"]
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Jami Tushum", fmt_money(kpi["rev"], curr))
-        k2.metric(cfg["cogs_label"], fmt_money(kpi["cogs"], curr))
-        k3.metric("Operatsion Xarajat (OPEX)", fmt_money(kpi["opex"], curr))
-        k4.metric("Sof Foyda", fmt_money(kpi["net"], curr), delta=f"{kpi['margin']:.1f}% marja")
+        tdf = pd.DataFrame(columns=["tx_date", "category", "item_name", "qty", "revenue", "cogs", "opex", "foyda"])
+        rev = cogs = opex = 0.0
 
-        st.subheader(f"🏭 '{industry}' uchun maxsus ko'rsatkichlar")
-        scols = st.columns(len(analysis["industry_kpis"]))
-        for col, (lbl, val, norm_txt, is_ok) in zip(scols, analysis["industry_kpis"]):
-            col.metric(lbl, val, delta=norm_txt, delta_color="normal" if is_ok else "inverse")
+    gross_profit = rev - cogs
+    net_profit = rev - cogs - opex
+    gross_margin = (gross_profit / rev * 100.0) if rev > 0 else 0.0
+    net_margin = (net_profit / rev * 100.0) if rev > 0 else 0.0
+
+    # --- 2. Qarzlar ---
+    receivables = payables = overdue_rec = overdue_pay = 0.0
+    if debts_df is not None and not debts_df.empty:
+        ddf = debts_df.copy()
+        ddf["amount"] = pd.to_numeric(ddf["amount"], errors="coerce").fillna(0.0)
+        is_open = ~ddf["status"].astype(str).str.lower().str.contains("to'lan")
+        is_rec = ddf["debt_type"].astype(str).str.lower().str.contains("bizga")
+        is_pay = ~is_rec
+        is_late = ddf["status"].astype(str).str.lower().str.contains("kechik")
+
+        receivables = float(ddf.loc[is_open & is_rec, "amount"].sum())
+        payables = float(ddf.loc[is_open & is_pay, "amount"].sum())
+        overdue_rec = float(ddf.loc[is_open & is_rec & is_late, "amount"].sum())
+        overdue_pay = float(ddf.loc[is_open & is_pay & is_late, "amount"].sum())
+    else:
+        ddf = pd.DataFrame(columns=["counterparty", "debt_type", "amount", "due_date", "status"])
+
+    # --- 3. Ombor va Sotilmay qolgan tovarlar ---
+    inv_val = dead_stock_val = 0.0
+    dead_items = pd.DataFrame()
+    if inv_df is not None and not inv_df.empty:
+        idf = inv_df.copy()
+        idf["qty"] = pd.to_numeric(idf["qty"], errors="coerce").fillna(0.0)
+        idf["unit_cost"] = pd.to_numeric(idf["unit_cost"], errors="coerce").fillna(0.0)
+        idf["jami_qiymat"] = idf["qty"] * idf["unit_cost"]
+        last_dt = pd.to_datetime(idf["last_sale_date"], errors="coerce").fillna(pd.Timestamp.today())
+        idf["yotgan_kun"] = (pd.Timestamp.today().normalize() - last_dt.dt.normalize()).dt.days.clip(lower=0)
+        inv_val = float(idf["jami_qiymat"].sum())
+        dead_mask = idf["yotgan_kun"] >= max(60, sector_norm["max_ombor_kun"])
+        dead_items = idf.loc[dead_mask].sort_values("jami_qiymat", ascending=False)
+        dead_stock_val = float(dead_items["jami_qiymat"].sum())
+    else:
+        idf = pd.DataFrame(columns=["item_name", "category", "qty", "unit_cost", "last_sale_date", "jami_qiymat", "yotgan_kun"])
+
+    # --- 4. Pul aylanish tezligi (kunlarda) ---
+    daily_rev = rev / days if rev > 0 else 0.0
+    daily_cogs = cogs / days if cogs > 0 else (daily_rev * 0.7 if daily_rev > 0 else 0.0)
+    ombor_kun = (inv_val / daily_cogs) if daily_cogs > 0 else 0.0
+    qarz_olish_kun = (receivables / daily_rev) if daily_rev > 0 else 0.0
+    qarz_berish_kun = (payables / daily_cogs) if daily_cogs > 0 else 0.0
+    pul_aylanish_kun = ombor_kun + qarz_olish_kun - qarz_berish_kun
+
+    # --- 5. Mahsulotlar reytingi (ABC-XYZ oddiy o'zbekchada) ---
+    if not tdf.empty:
+        prod_df = (
+            tdf.groupby("item_name", as_index=False)
+            .agg(
+                miqdor=("qty", "sum"),
+                tushum=("revenue", "sum"),
+                tannarx=("cogs", "sum"),
+                xarajat=("opex", "sum"),
+                sof_foyda=("foyda", "sum"),
+                sotuv_soni=("revenue", "count"),
+                ortacha=("revenue", "mean"),
+                tebranish=("revenue", "std"),
+            )
+            .sort_values("tushum", ascending=False)
+            .reset_index(drop=True)
+        )
+        pos_rev = prod_df.loc[prod_df["tushum"] > 0, "tushum"].sum()
+        prod_df["ulush_foiz"] = np.where(prod_df["tushum"] > 0, prod_df["tushum"] / pos_rev * 100.0, 0.0) if pos_rev > 0 else 0.0
+        prod_df["jamlangan_foiz"] = prod_df["ulush_foiz"].cumsum()
+        prev_cum = prod_df["jamlangan_foiz"].shift(1, fill_value=0.0)
+
+        def _daraja(row, prev_c):
+            if row["sof_foyda"] < 0:
+                return "Zararli"
+            if prev_c < 80.0:
+                return "Asosiy (Top)"
+            if prev_c < 95.0:
+                return "O'rtacha"
+            return "Zaif"
+
+        prod_df["Daraja"] = [_daraja(r, prev_cum.iloc[i]) for i, r in prod_df.iterrows()]
+
+        def _barqarorlik(row):
+            if row["sotuv_soni"] < 2 or pd.isna(row["tebranish"]) or row["ortacha"] <= 0:
+                return "Kam sotiladi"
+            cv = (row["tebranish"] / row["ortacha"]) * 100.0
+            if cv <= 15:
+                return "Doimiy talab"
+            if cv <= 35:
+                return "O'zgaruvchan"
+            return "Tartibsiz"
+
+        prod_df["Talab holati"] = prod_df.apply(_barqarorlik, axis=1)
+
+        def _tavsiya(row):
+            if row["Daraja"] == "Zararli":
+                return "Narxini oshiring yoki sotuvdan olib tashlang"
+            if row["Daraja"] == "Asosiy (Top)":
+                return "Omborda doim bo'lishi shart — asosiy daromad manbai"
+            if row["Daraja"] == "O'rtacha":
+                return "Muntazam nazorat qiling va aksiyalar bilan oshiring"
+            return "Ortiqcha zaxira ushlamang, buyurtma asosida olib keling"
+
+        prod_df["Maslahat"] = prod_df.apply(_tavsiya, axis=1)
+    else:
+        prod_df = pd.DataFrame(columns=["item_name", "miqdor", "tushum", "tannarx", "xarajat", "sof_foyda", "ulush_foiz", "jamlangan_foiz", "Daraja", "Talab holati", "Maslahat"])
+
+    # --- 6. Zararsiz ishlash chegarasi ---
+    var_ratio = (cogs / rev) if rev > 0 else 0.70
+    cmr = 1.0 - var_ratio
+    bep_rev = (opex / cmr) if cmr > 0 else float("inf")
+    safety_amt = (rev - bep_rev) if np.isfinite(bep_rev) else -opex
+    safety_pct = (safety_amt / rev * 100.0) if (rev > 0 and np.isfinite(bep_rev)) else 0.0
+
+    # --- 7. Mijozlar, Jamoa va 5 yo'nalish bahosi (0-100) ---
+    tot_c = max(int(prof["jami_mijozlar"]), 1)
+    new_c = max(int(prof["yangi_mijozlar"]), 0)
+    rep_c = min(max(int(prof["qayta_mijozlar"]), 0), tot_c)
+    mkt = max(float(prof["reklama_xarajati"]), 0.0)
+    lt_m = max(float(prof["mijoz_davomiyligi_oy"]), 1.0)
+
+    qayta_foiz = rep_c / tot_c * 100.0
+    mijoz_jalb_narxi = (mkt / new_c) if new_c > 0 else 0.0
+    oylik_chek = (rev / tot_c) * (30.0 / days) if rev > 0 else 0.0
+    mijoz_foydasi = oylik_chek * lt_m * max(gross_margin / 100.0, 0.1)
+    foyda_reklama_nisbat = (mijoz_foydasi / mijoz_jalb_narxi) if mijoz_jalb_narxi > 0 else (3.5 if rev > 0 else 0.0)
+
+    emp = max(int(prof["xodimlar_soni"]), 1)
+    oylik_fondi = max(float(prof["oylik_fondi"]), 0.0)
+    xodim_tushumi = rev / emp if rev > 0 else 0.0
+    oylik_ulushi = (oylik_fondi / rev * 100.0) if rev > 0 else 0.0
+    kadr_ketish = (max(int(prof["ketgan_xodimlar"]), 0) / emp) * 100.0
+
+    # 5 ta yo'nalish ballari
+    ball_moliya = clamp((50.0 + net_margin * 2.5 if rev > 0 else 30.0) - max(0.0, pul_aylanish_kun - 25.0) * 0.6)
+    ball_mijoz = clamp((clamp(foyda_reklama_nisbat / 3.5 * 100.0) * 0.55) + (clamp(qayta_foiz / 55.0 * 100.0) * 0.45))
+    ball_sifat = clamp((100.0 - float(prof["brak_qaytarilish"]) * 8.0) * 0.5 + clamp(float(prof["quvvat_bandligi"]) / 80.0 * 100.0) * 0.5)
+    ball_jamoa = clamp((100.0 - max(0.0, oylik_ulushi - 22.0) * 2.0) * 0.45 + float(prof["reja_bajarilishi"]) * 0.35 + (100.0 - kadr_ketish * 4.5) * 0.20)
+    ball_xavfsizlik = clamp((100.0 - max(0.0, float(prof["top3_mijoz_ulushi"]) - 25.0) * 1.4) * 0.5 + (100.0 - max(0.0, float(prof["asosiy_yetkazuvchi_ulushi"]) - 35.0) * 1.3) * 0.5)
+
+    ballar = {
+        "Moliya va foyda": round(ball_moliya, 1),
+        "Mijozlar va sotuv": round(ball_mijoz, 1),
+        "Sifat va ish jarayoni": round(ball_sifat, 1),
+        "Jamoa samaradorligi": round(ball_jamoa, 1),
+        "Xavfsizlik va barqarorlik": round(ball_xavfsizlik, 1),
+    }
+    umumiy_ball = round(
+        ball_moliya * 0.28 + ball_mijoz * 0.22 + ball_sifat * 0.18 + ball_jamoa * 0.17 + ball_xavfsizlik * 0.15,
+        1,
+    )
+
+    if umumiy_ball >= 80:
+        holat_matni, holat_turi = "Barqaror va sog'lom biznes", "good"
+    elif umumiy_ball >= 62:
+        holat_matni, holat_turi = "Yaxshi, lekin yaxshilash kerak bo'lgan joylar bor", "warn"
+    else:
+        holat_matni, holat_turi = "Diqqat! Muhim muammolarni tezroq hal qilish kerak", "bad"
+
+    # --- 8. Muammolar va Aniq Yechimlar ---
+    curr = company["currency"]
+    muammolar = []
+
+    if rev > 0 and net_margin < sector_norm["min_marja"]:
+        if gross_margin < 22.0:
+            sabab = f"Sotuv narxi bilan tannarx orasidagi farq kichik ({gross_margin:.1f}%)."
+            yechim = "Eng kam foyda berayotgan mahsulotlar narxini 5–8% ga oshiring yoki arzonroq yetkazib beruvchi toping."
+            samara = rev * 0.04
+        else:
+            sabab = f"Asosiy daromad yaxshi ({gross_margin:.1f}%), lekin boshqa xarajatlar foydani yeb qo'ymoqda."
+            yechim = "Ijara, ma'muriy va keraksiz oylik xarajatlarni kamida 12% ga qisqartiring."
+            samara = opex * 0.12
+        muammolar.append({
+            "daraja": "Yuqori" if net_profit < 0 else "O'rta",
+            "bolim": "Foyda va xarajat",
+            "muammo": f"Sof foyda ulushi past ({net_margin:.1f}%, me'yor kamida {sector_norm['min_marja']:.0f}%)",
+            "sabab": sabab,
+            "yechim": yechim,
+            "samara_summa": samara,
+            "samara_matn": f"+{fmt_pul(samara, curr)} qo'shimcha sof foyda",
+            "bosqich": "1-oy (Shoshilinch)",
+        })
+
+    zararli_soni = int((prod_df["sof_foyda"] < 0).sum()) if not prod_df.empty else 0
+    if zararli_soni > 0:
+        zarar_jami = abs(float(prod_df.loc[prod_df["sof_foyda"] < 0, "sof_foyda"].sum()))
+        nomlar = ", ".join(prod_df.loc[prod_df["sof_foyda"] < 0, "item_name"].head(3).tolist())
+        muammolar.append({
+            "daraja": "Yuqori",
+            "bolim": "Mahsulotlar",
+            "muammo": f"{zararli_soni} ta mahsulot zarar keltirmoqda ({nomlar})",
+            "sabab": "Bu tovarlarni sotishdan tushgan pul ularning tannarxi va xarajatini qoplamayapti.",
+            "yechim": "Ushbu mahsulotlar narxini qayta hisoblang yoki sotuvdan chiqarib tashlang.",
+            "samara_summa": zarar_jami,
+            "samara_matn": f"+{fmt_pul(zarar_jami, curr)} zararning oldi olinadi",
+            "bosqich": "1-oy (Shoshilinch)",
+        })
+
+    if overdue_rec > 0:
+        muammolar.append({
+            "daraja": "Yuqori",
+            "bolim": "Qarzlar va pul",
+            "muammo": f"Mijozlardan {fmt_pul(overdue_rec, curr)} miqdorida muddati o'tgan qarz bor",
+            "sabab": "To'lov muddatlari qat'iy nazorat qilinmagan va oldindan to'lov olinmagan.",
+            "yechim": "Qarzdorlar bilan shu hafta bog'lanib to'lov grafigi tuzing; yangi savdolarda kamida 30% oldindan to'lov joriy qiling.",
+            "samara_summa": overdue_rec * 0.7,
+            "samara_matn": f"+{fmt_pul(overdue_rec * 0.7, curr)} naqd pul kassaga qaytadi",
+            "bosqich": "1-oy (Shoshilinch)",
+        })
+
+    if dead_stock_val > 0:
+        muammolar.append({
+            "daraja": "O'rta",
+            "bolim": "Ombor",
+            "muammo": f"Omborda {len(dead_items)} turdagi tovar uzoq vaqtdan beri sotilmay yotibdi",
+            "sabab": f"{fmt_pul(dead_stock_val, curr)} pulingiz omborda harakatsiz qolib ketgan.",
+            "yechim": "Bu tovarlarga 15–25% chegirma yoki boshqa tovar bilan birga aksiya qilib naqd pulga aylantiring.",
+            "samara_summa": dead_stock_val * 0.8,
+            "samara_matn": f"+{fmt_pul(dead_stock_val * 0.8, curr)} naqd pul aylanmaga qaytadi",
+            "bosqich": "1-oy (Shoshilinch)",
+        })
+
+    if rev > 0 and oylik_ulushi > 28.0:
+        ortiqcha = max(oylik_fondi - rev * 0.24, 0.0)
+        muammolar.append({
+            "daraja": "O'rta",
+            "bolim": "Jamoa va oylik",
+            "muammo": f"Ish haqi xarajati jami savdoning {oylik_ulushi:.1f}% ini tashkil etmoqda",
+            "sabab": f"Har bir xodimga to'g'ri keladigan savdo ({fmt_pul(xodim_tushumi, curr)}) oylik yukini qoplash uchun yetarli emas.",
+            "yechim": "Oylikning 30% qismini aniq savdo va bajarilgan ish natijasiga (bonusga) bog'lab qo'ying.",
+            "samara_summa": ortiqcha * 0.5,
+            "samara_matn": f"+{fmt_pul(ortiqcha * 0.5, curr)} samaradorlik oshishi",
+            "bosqich": "2-oy (Tartibga solish)",
+        })
+
+    if float(prof["brak_qaytarilish"]) > 3.0 and rev > 0:
+        brak_zarar = rev * (float(prof["brak_qaytarilish"]) / 100.0)
+        muammolar.append({
+            "daraja": "O'rta",
+            "bolim": "Sifat nazorati",
+            "muammo": f"Qaytarilgan yoki nuqsonli mahsulotlar ulushi yuqori ({prof['brak_qaytarilish']:.1f}%)",
+            "sabab": f"Sifat tekshiruvi sustligi tufayli taxminan {fmt_pul(brak_zarar, curr)} yo'qotilmoqda.",
+            "yechim": "Mijozga topshirishdan oldin oddiy 5 bandli sifat tekshiruv varag'ini majburiy qiling.",
+            "samara_summa": brak_zarar * 0.6,
+            "samara_matn": f"+{fmt_pul(brak_zarar * 0.6, curr)} tejaladi",
+            "bosqich": "2-oy (Tartibga solish)",
+        })
+
+    if mijoz_jalb_narxi > 0 and foyda_reklama_nisbat < 3.0:
+        muammolar.append({
+            "daraja": "O'rta",
+            "bolim": "Mijozlar va reklama",
+            "muammo": f"Reklama o'zini sekin oqlayapti (1 so'mga {foyda_reklama_nisbat:.1f} so'm qaytmoqda)",
+            "sabab": f"1 ta yangi mijoz jalb qilish {fmt_pul(mijoz_jalb_narxi, curr)} ga tushmoqda, qayta xarid esa {qayta_foiz:.0f}%.",
+            "yechim": "Natija bermayotgan reklamani to'xtating va eski mijozlarga Telegram/SMS orqali qayta taklif yuboring.",
+            "samara_summa": mkt * 0.25,
+            "samara_matn": f"+{fmt_pul(mkt * 0.25, curr)} reklama tejami",
+            "bosqich": "2-oy (Tartibga solish)",
+        })
+
+    if float(prof["top3_mijoz_ulushi"]) > 45.0 and rev > 0:
+        xavf_pul = rev * (float(prof["top3_mijoz_ulushi"]) / 100.0) / 3.0
+        muammolar.append({
+            "daraja": "O'rta",
+            "bolim": "Biznes xavfsizligi",
+            "muammo": f"Savdoning {prof['top3_mijoz_ulushi']:.0f}% i bor-yo'g'i 3 ta mijozga bog'lanib qolgan",
+            "sabab": f"Agar ulardan bittasi ketsa, tushumingiz birdan ~{fmt_pul(xavf_pul, curr)} ga tushib ketadi.",
+            "yechim": "Yangi o'rta mijozlarni ko'paytiring — bitta mijoz ulushi 15% dan oshmasligiga harakat qiling.",
+            "samara_summa": xavf_pul,
+            "samara_matn": f"{fmt_pul(xavf_pul, curr)} lik tushumni xavfdan himoyalash",
+            "bosqich": "3-oy (Rivojlanish)",
+        })
+
+    if not muammolar:
+        muammolar.append({
+            "daraja": "Past",
+            "bolim": "O'sish imkoniyati",
+            "muammo": "Jiddiy muammo topilmadi — korxona barqaror ishlamoqda",
+            "sabab": "Asosiy moliyaviy va ichki ko'rsatkichlar me'yorida.",
+            "yechim": "Eng foydali mahsulotlar zaxirasini ko'paytiring va yangi savdo kanallarini oching.",
+            "samara_summa": rev * 0.15,
+            "samara_matn": f"+{fmt_pul(rev * 0.15, curr)} qo'shimcha o'sish imkoniyati",
+            "bosqich": "3-oy (Rivojlanish)",
+        })
+
+    order_map = {"Yuqori": 0, "O'rta": 1, "Past": 2}
+    muammolar.sort(key=lambda x: (order_map.get(x["daraja"], 3), -x["samara_summa"]))
+
+    # --- 9. 12 oylik 3-ssenariyli prognoz ---
+    oylik_koeff = 30.0 / days
+    m_rev = rev * oylik_koeff
+    m_opex = opex * oylik_koeff
+    m_var_ratio = var_ratio
+
+    fc_rows = []
+    for oy in range(1, 13):
+        ramp = min(1.0, oy / 4.0)
+        yomon = (m_rev * (0.975 ** (oy - 1))) * (1.0 - min(m_var_ratio + 0.03, 0.96)) - m_opex * (1.015 ** (oy - 1))
+        ortacha = (m_rev * (1.02 ** (oy - 1))) * (1.0 - m_var_ratio) - m_opex * (1.008 ** (oy - 1))
+        yaxshi = (m_rev * (1.045 ** (oy - 1))) * (1.0 - max(0.10, m_var_ratio - 0.035 * ramp)) - m_opex * (1.0 - 0.08 * ramp) * (1.005 ** (oy - 1))
+        fc_rows.append({
+            "Oy": f"{oy}-oy",
+            "Yomon holat": yomon,
+            "Hozirgi holat": ortacha,
+            "Reja bajarilganda": yaxshi,
+        })
+    forecast_df = pd.DataFrame(fc_rows)
+
+    # Kassa 30 kunlik prognozi
+    cash_now = float(company["cash_balance"])
+    expected_cash_30 = cash_now + (net_profit * oylik_koeff) + (receivables * 0.6) - payables
+
+    return {
+        "tdf": tdf,
+        "ddf": ddf,
+        "idf": idf,
+        "prod_df": prod_df,
+        "dead_items": dead_items,
+        "forecast_df": forecast_df,
+        "rev": rev,
+        "cogs": cogs,
+        "opex": opex,
+        "gross_profit": gross_profit,
+        "net_profit": net_profit,
+        "gross_margin": gross_margin,
+        "net_margin": net_margin,
+        "receivables": receivables,
+        "payables": payables,
+        "overdue_rec": overdue_rec,
+        "overdue_pay": overdue_pay,
+        "inv_val": inv_val,
+        "dead_stock_val": dead_stock_val,
+        "ombor_kun": ombor_kun,
+        "qarz_olish_kun": qarz_olish_kun,
+        "qarz_berish_kun": qarz_berish_kun,
+        "pul_aylanish_kun": pul_aylanish_kun,
+        "bep_rev": bep_rev,
+        "safety_amt": safety_amt,
+        "safety_pct": safety_pct,
+        "var_ratio": var_ratio,
+        "qayta_foiz": qayta_foiz,
+        "mijoz_jalb_narxi": mijoz_jalb_narxi,
+        "foyda_reklama_nisbat": foyda_reklama_nisbat,
+        "xodim_tushumi": xodim_tushumi,
+        "oylik_ulushi": oylik_ulushi,
+        "ballar": ballar,
+        "umumiy_ball": umumiy_ball,
+        "holat_matni": holat_matni,
+        "holat_turi": holat_turi,
+        "muammolar": muammolar,
+        "cash_now": cash_now,
+        "expected_cash_30": expected_cash_30,
+        "sector_norm": sector_norm,
+    }
+
+
+# =========================================================
+# 6. TAYYOR PDF VA EXCEL HISOBOTLAR
+# =========================================================
+def _pdf_safe(text) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    for k, v in {"‘": "'", "’": "'", "ʻ": "'", "ʼ": "'", "—": "-", "–": "-", "…": "...", "«": '"', "»": '"'}.items():
+        s = s.replace(k, v)
+    s = s.encode("latin-1", "ignore").decode("latin-1")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def build_pdf_report(company: dict, res: dict) -> bytes:
+    if not FPDF_AVAILABLE:
+        raise RuntimeError("PDF yaratish uchun requirements.txt faylida fpdf2 bo'lishi kerak.")
+    curr = company["currency"]
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+
+    # Sarlavha
+    pdf.set_fill_color(30, 58, 138)
+    pdf.rect(0, 0, 210, 30, "F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_xy(12, 7)
+    pdf.cell(0, 8, _pdf_safe("BIZNES TAHLIL VA RIVOJLANISH HISOBOTI"), ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_xy(12, 17)
+    pdf.cell(0, 6, _pdf_safe(f"Korxona: {company['name']}  |  Soha: {company['sector']}  |  Sana: {date.today()}"), ln=True)
+
+    pdf.ln(14)
+    pdf.set_text_color(15, 23, 42)
+
+    # 1. Asosiy raqamlar
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(30, 58, 138)
+    pdf.cell(0, 8, _pdf_safe("1. Asosiy Moliyaviy Natijalar"), ln=True)
+    pdf.set_text_color(15, 23, 42)
+
+    rows = [
+        ("Jami savdo (Tushum)", fmt_pul(res["rev"], curr)),
+        ("Mahsulot tannarxi", fmt_pul(res["cogs"], curr)),
+        ("Boshqa xarajatlar", fmt_pul(res["opex"], curr)),
+        ("Sof foyda", fmt_pul(res["net_profit"], curr)),
+        ("Sof foyda ulushi", f"{res['net_margin']:.1f}%"),
+        ("Kassadagi pul", fmt_pul(res["cash_now"], curr)),
+        ("Biznes sog'lomlik bahosi", f"{res['umumiy_ball']:.1f} / 100"),
+    ]
+    for idx, (lbl, val) in enumerate(rows):
+        pdf.set_fill_color(241, 245, 249 if idx % 2 == 0 else 255)
+        is_bold = lbl in ("Sof foyda", "Biznes sog'lomlik bahosi")
+        pdf.set_font("Helvetica", "B" if is_bold else "", 10)
+        pdf.cell(110, 7, _pdf_safe(lbl), border=1, fill=True)
+        pdf.cell(75, 7, _pdf_safe(val), border=1, align="R", fill=True, ln=True)
+
+    pdf.ln(6)
+
+    # 2. 5 yo'nalish bahosi
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(30, 58, 138)
+    pdf.cell(0, 8, _pdf_safe("2. Korxonaning 5 Yo'nalish Bo'yicha Bahosi"), ln=True)
+    pdf.set_text_color(15, 23, 42)
+    pdf.set_font("Helvetica", "", 10)
+    for k, v in res["ballar"].items():
+        pdf.cell(110, 6.5, _pdf_safe(k), border=1)
+        pdf.cell(75, 6.5, _pdf_safe(f"{v:.1f} / 100"), border=1, align="R", ln=True)
+
+    pdf.ln(6)
+
+    # 3. Asosiy muammolar va yechimlar
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(30, 58, 138)
+    pdf.cell(0, 8, _pdf_safe("3. Aniqlangan Muammolar va Yechimlar"), ln=True)
+    pdf.set_text_color(15, 23, 42)
+
+    for i, m in enumerate(res["muammolar"][:6], start=1):
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.multi_cell(usable_w, 6, _pdf_safe(f"{i}. [{m['bosqich']}] {m['muammo']}"))
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "", 9.5)
+        pdf.multi_cell(usable_w, 5.5, _pdf_safe(f"   Sababi: {m['sabab']}"))
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(usable_w, 5.5, _pdf_safe(f"   Yechim: {m['yechim']} ({m['samara_matn']})"))
+        pdf.ln(2)
+
+    out = pdf.output(dest="S")
+    return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
+
+
+def build_excel_report(company: dict, res: dict) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        summary = pd.DataFrame([
+            {"Ko'rsatkich": "Korxona nomi", "Qiymat": company["name"]},
+            {"Ko'rsatkich": "Faoliyat sohasi", "Qiymat": company["sector"]},
+            {"Ko'rsatkich": "Jami savdo", "Qiymat": res["rev"]},
+            {"Ko'rsatkich": "Mahsulot tannarxi", "Qiymat": res["cogs"]},
+            {"Ko'rsatkich": "Boshqa xarajatlar", "Qiymat": res["opex"]},
+            {"Ko'rsatkich": "Sof foyda", "Qiymat": res["net_profit"]},
+            {"Ko'rsatkich": "Sof foyda ulushi (%)", "Qiymat": round(res["net_margin"], 1)},
+            {"Ko'rsatkich": "Biznes bahosi (0-100)", "Qiymat": res["umumiy_ball"]},
+        ])
+        summary.to_excel(writer, sheet_name="Umumiy_Xulosa", index=False)
+        if not res["prod_df"].empty:
+            res["prod_df"][["item_name", "miqdor", "tushum", "sof_foyda", "Daraja", "Talab holati", "Maslahat"]].rename(
+                columns={"item_name": "Mahsulot", "miqdor": "Miqdor", "tushum": "Savdo", "sof_foyda": "Sof foyda"}
+            ).to_excel(writer, sheet_name="Mahsulotlar_Tahlili", index=False)
+        pd.DataFrame(res["muammolar"])[["bosqich", "daraja", "bolim", "muammo", "sabab", "yechim", "samara_matn"]].rename(
+            columns={
+                "bosqich": "Bosqich", "daraja": "Muhimlik", "bolim": "Bo'lim",
+                "muammo": "Muammo", "sabab": "Sababi", "yechim": "Yechim", "samara_matn": "Kutilayotgan samara"
+            }
+        ).to_excel(writer, sheet_name="Muammolar_va_Reja", index=False)
+        res["forecast_df"].to_excel(writer, sheet_name="12_Oylik_Prognoz", index=False)
+    return buf.getvalue()
+
+
+# =========================================================
+# 7. INTERFEYS YORDAMCHI KOMPONENTLARI
+# =========================================================
+def render_kpi_card(label: str, value: str, note: str, tone: str = "muted"):
+    tone_cls = {"good": "kpi-good", "warn": "kpi-warn", "bad": "kpi-bad"}.get(tone, "kpi-muted")
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value">{value}</div>
+            <div class="kpi-note {tone_cls}">{note}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_issue_card(idx: int, item: dict):
+    cls = "issue-high" if item["daraja"] == "Yuqori" else ("issue-mid" if item["daraja"] == "O'rta" else "issue-low")
+    badge = "🔴 Muhim" if item["daraja"] == "Yuqori" else ("🟠 O'rtacha" if item["daraja"] == "O'rta" else "🟢 Tavsiya")
+    st.markdown(
+        f"""
+        <div class="issue-card {cls}">
+            <div style="font-size:0.82rem; color:#64748B; font-weight:600; margin-bottom:4px;">
+                {badge} &nbsp;•&nbsp; {item['bolim']} &nbsp;•&nbsp; {item['bosqich']}
+            </div>
+            <div style="font-size:1.05rem; font-weight:700; color:#0F172A; margin-bottom:6px;">
+                {idx}. {item['muammo']}
+            </div>
+            <div style="font-size:0.92rem; color:#334155; margin-bottom:4px;">
+                <b>Nega bunday bo'ldi?</b> {item['sabab']}
+            </div>
+            <div style="font-size:0.92rem; color:#1E3A8A; margin-bottom:6px;">
+                <b>Nima qilish kerak?</b> {item['yechim']}
+            </div>
+            <div style="font-size:0.86rem; font-weight:700; color:#15803D;">
+                Kutilayotgan foyda: {item['samara_matn']}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================================================
+# 8. ASOSIY ILOVA OQIMI
+# =========================================================
+def main():
+    init_db()
+    ensure_default_company()
+    companies = list_companies()
+
+    # --- CHAP TOMONDAGI SODDA MENYU (SIDEBAR) ---
+    with st.sidebar:
+        st.markdown("## 📊 Biznes Yordamchi")
+        st.caption("Oddiy va tushunarli biznes tahlili")
+
+        menu = st.radio(
+            "Bo'limni tanlang:",
+            options=[
+                "🏠 Bosh sahifa",
+                "📥 Ma'lumot kiritish",
+                "📊 Savdo va Mahsulotlar",
+                "💰 Pul, Qarz va Ombor",
+                "🩺 Muammolar, Reja va Hisobot",
+            ],
+            label_visibility="collapsed",
+        )
 
         st.divider()
-        c_l, c_r = st.columns([3, 2])
-        with c_l:
-            st.subheader("Oylik Moliyaviy Dinamika")
-            mdf = analysis["monthly_df"]
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=mdf["Oy"], y=mdf["Tushum"], name="Tushum", marker_color="#2563EB"))
-            fig.add_trace(go.Bar(x=mdf["Oy"], y=mdf["Tannarx"] + mdf["OPEX"], name="Jami Xarajat", marker_color="#F59E0B"))
-            fig.add_trace(go.Scatter(x=mdf["Oy"], y=mdf["Sof_foyda"], name="Sof Foyda", mode="lines+markers", line=dict(color="#10B981", width=3)))
-            fig.update_layout(barmode="group", height=360, margin=dict(l=10, r=10, t=10, b=10))
+        st.markdown("**🏢 Korxonangiz**")
+        comp_labels = {f"{c['name']}": c for c in companies}
+        selected_name = st.selectbox("Korxona tanlash", list(comp_labels.keys()), label_visibility="collapsed")
+        company = comp_labels[selected_name]
+        st.caption(f"Soha: {company['sector']}")
+
+        new_cash = st.number_input(
+            f"Hozir kassadagi pul ({company['currency']})",
+            min_value=0.0,
+            value=float(company["cash_balance"]),
+            step=1_000_000.0,
+            format="%.0f",
+        )
+        if abs(new_cash - float(company["cash_balance"])) > 0.01:
+            update_company_cash(company["id"], new_cash)
+            company["cash_balance"] = new_cash
+
+        with st.expander("➕ Yangi korxona qo'shish"):
+            with st.form("add_comp_form", clear_on_submit=True):
+                c_name = st.text_input("Korxona nomi", placeholder="Masalan: Baraka Savdo")
+                c_sector = st.selectbox("Faoliyat sohasi", list(SOHALAR.keys()))
+                c_curr = st.selectbox("Valyuta", ["so'm", "USD", "RUB"])
+                c_cash = st.number_input("Boshlang'ich kassa", min_value=0.0, value=0.0, step=1_000_000.0)
+                if st.form_submit_button("Qo'shish", use_container_width=True, type="primary"):
+                    ok, msg = create_company(c_name, c_sector, c_curr, c_cash)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        if len(companies) > 1:
+            with st.expander("🗑️ Korxonani o'chirish"):
+                st.warning(f"'{company['name']}' va uning barcha ma'lumotlari o'chadi.")
+                if st.button("Ha, o'chirish", use_container_width=True):
+                    delete_company(company["id"])
+                    st.rerun()
+
+    # Ma'lumotlarni yuklash va hisoblash
+    tx_df = load_table("transactions", company["id"])
+    debts_df = load_table("debts", company["id"])
+    inv_df = load_table("inventory", company["id"])
+    prof = load_profile(company["id"])
+    res = compute_full_analysis(company, tx_df, debts_df, inv_df, prof)
+    curr = company["currency"]
+
+    # Yuqori tushunarli sarlavha
+    st.markdown(
+        f"""
+        <div class="hero-card">
+            <div class="hero-title">{company['name']} — {menu.split(' ', 1)[1]}</div>
+            <div class="hero-sub">Soha: {company['sector']} &nbsp;|&nbsp; Umumiy holat: {res['holat_matni']} ({res['umumiy_ball']:.0f}/100 ball)</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # =====================================================
+    # 1-BO'LIM: BOSH SAHIFA (ENG MUHIM NARSALAR 1 EKRANDA)
+    # =====================================================
+    if menu == "🏠 Bosh sahifa":
+        if tx_df.empty:
+            st.markdown(
+                """
+                <div class="hint-box">
+                    <b>👋 Xush kelibsiz! Boshlash juda oson — atigi 2 ta qadam:</b><br>
+                    1. Tizim qanday ishlashini darhol ko'rish uchun pastdagi <b>"Namuna ma'lumot bilan sinab ko'rish"</b> tugmasini bosing.<br>
+                    2. O'zingizning raqamlaringizni kiritish uchun chap menyudan <b>"📥 Ma'lumot kiritish"</b> bo'limiga o'ting.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            b1, b2 = st.columns([1, 2])
+            if b1.button("✨ Namuna ma'lumot bilan sinab ko'rish", type="primary", use_container_width=True):
+                load_demo_data(company["id"])
+                st.success("Namuna ma'lumotlar yuklandi!")
+                st.rerun()
+            st.stop()
+
+        # 4 ta asosiy karta
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            render_kpi_card("Jami savdo (Tushum)", fmt_pul(res["rev"], curr), f"{len(tx_df)} ta savdo qatori", "muted")
+        with c2:
+            foyda_tone = "good" if res["net_profit"] > 0 else "bad"
+            render_kpi_card("Sof foyda", fmt_pul(res["net_profit"], curr), f"Savdoning {res['net_margin']:.1f}% i foyda", foyda_tone)
+        with c3:
+            kassa_tone = "good" if res["expected_cash_30"] >= 0 else "bad"
+            kassa_izoh = "30 kundan keyin ham pul yetarli" if res["expected_cash_30"] >= 0 else "30 kunda pul yetishmasligi xavfi bor!"
+            render_kpi_card("Kassadagi pul", fmt_pul(res["cash_now"], curr), kassa_izoh, kassa_tone)
+        with c4:
+            render_kpi_card("Biznes bahosi", f"{res['umumiy_ball']:.0f} / 100 ball", res["holat_matni"], res["holat_turi"])
+
+        st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+        # Oddiy grafik + Top 3 muammo yonma-yon
+        left, right = st.columns([1.2, 1])
+        with left:
+            st.subheader("📈 Pul qayerga ketyapti?")
+            fig = go.Figure(
+                go.Bar(
+                    x=["Jami savdo", "Tannarx", "Boshqa xarajat", "Sof foyda"],
+                    y=[res["rev"], res["cogs"], res["opex"], res["net_profit"]],
+                    marker_color=["#2563EB", "#64748B", "#D97706", "#16A34A" if res["net_profit"] >= 0 else "#DC2626"],
+                    text=[fmt_pul(v, "") for v in [res["rev"], res["cogs"], res["opex"], res["net_profit"]]],
+                    textposition="outside",
+                )
+            )
+            fig.update_layout(
+                height=340,
+                margin=dict(l=10, r=10, t=20, b=20),
+                plot_bgcolor="#FFFFFF",
+                paper_bgcolor="#FFFFFF",
+                yaxis_title=curr,
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-        with c_r:
-            st.subheader(f"{cfg['item_label']} Rentabelligi")
-            idf = analysis["item_df"].copy()
-            idf["Holat"] = np.where(idf["Sof_foyda"] < 0, "Zararli", "Foydali")
-            fig_i = px.bar(idf, x="Sof_foyda", y="item_name", orientation="h", color="Holat", color_discrete_map={"Zararli": "#EF4444", "Foydali": "#10B981"}, text_auto=".2s")
-            fig_i.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="")
-            st.plotly_chart(fig_i, use_container_width=True)
+        with right:
+            st.subheader("🚨 Eng muhim 3 ta masala")
+            for idx, m in enumerate(res["muammolar"][:3], start=1):
+                render_issue_card(idx, m)
 
-        g1, g2 = st.columns(2)
-        with g1:
-            st.subheader(f"{cfg['group_label']} Samaradorligi")
-            st.dataframe(analysis["group_df"].style.format({"Tushum": "{:,.0f}", "Tannarx": "{:,.0f}", "OPEX": "{:,.0f}", "Sof_foyda": "{:,.0f}", "Marja_%": "{:.1f}%"}), use_container_width=True)
-        with g2:
-            st.subheader("Xarajatlar Tarkibi")
-            fig_e = px.pie(analysis["exp_df"], values="OPEX", names="expense_type", hole=0.45)
-            fig_e.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_e, use_container_width=True)
+        st.caption("Batafsil jadvallar va grafiklarni ko'rish uchun chap menyudan kerakli bo'limni tanlang.")
 
-        st.subheader(f"ABC (Pareto) va Birlik Tannarx Tahlili")
-        st.dataframe(analysis["abc_df"][["item_name", "Miqdor", "Tushum", "Birlik_tannarx", "Sof_foyda", "Marja_%", "ABC"]].style.format({"Tushum": "{:,.0f}", "Birlik_tannarx": "{:,.0f}", "Sof_foyda": "{:,.0f}", "Marja_%": "{:.1f}%"}), use_container_width=True)
+    # =====================================================
+    # 2-BO'LIM: MA'LUMOT KIRITISH (EXCEL + QO'LDA + PROFIL)
+    # =====================================================
+    elif menu == "📥 Ma'lumot kiritish":
+        t_excel, t_manual, t_prof = st.tabs([
+            "📂 Excel yuklash (Eng oson)",
+            "✍️ Jadvalda qo'lda kiritish",
+            "🏢 Mijozlar, Jamoa va Sifat",
+        ])
 
-tab_idx += 1
+        with t_excel:
+            st.markdown(
+                """
+                <div class="hint-box">
+                    <b>Excel orqali yuklash tartibi:</b> Avval tayyor shablonni yuklab olib to'ldiring, so'ng shu yerga tashlang.
+                    Bo'sh qatorlar yoki to'ldirilmagan kataklar bo'lsa ham tizim o'zi tozalab xatosiz qabul qiladi.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            col_dl, col_demo = st.columns(2)
+            col_dl.download_button(
+                "⬇️ Tayyor Excel shablonini yuklab olish",
+                data=build_excel_template(),
+                file_name="biznes_shablon.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            if col_demo.button("✨ Tayyor namuna ma'lumotlarni yuklash", use_container_width=True):
+                load_demo_data(company["id"])
+                st.success("Namuna ma'lumotlar yuklandi! Endi 'Bosh sahifa'ga o'ting.")
+                st.rerun()
 
-# =========================================================
-# TAB 3: CASH FLOW VA QARZLAR
-# =========================================================
-with tabs[tab_idx]:
-    if not analysis["has_tx"]:
-        st.info("Cash Flow prognozi uchun avval operatsiyalar kiriting.")
-    else:
-        cf = analysis["cf"]
-        st.subheader(f"Keyingi {forecast_days} Kunlik Kassa Prognozi")
-        if not cf["gap"].empty:
-            st.error(f"🚨 Kassa uzilishi xavfi: **{len(cf['gap'])} kun** (eng past nuqta: **{fmt_money(cf['min_bal'], curr)}**).")
-        else:
-            st.success(f"✅ Kassa barqaror. Davr oxiridagi prognoz qoldiq: **{fmt_money(cf['end_bal'], curr)}**.")
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            uploaded = st.file_uploader("Excel faylingizni (.xlsx) tanlang:", type=["xlsx", "xls"])
+            mode = st.radio(
+                "Yuklanganda eski ma'lumotlar nima bo'lsin?",
+                ["Eskisini yangisiga almashtirish", "Eskisining ustiga qo'shish (faqat savdo)"],
+                horizontal=True,
+            )
+            if uploaded is not None:
+                if st.button("📥 Faylni o'qish va saqlash", type="primary"):
+                    try:
+                        parsed = parse_uploaded_excel(uploaded.getvalue())
+                        if parsed["tx"].empty and parsed["debts"].empty and parsed["inv"].empty:
+                            st.warning("Fayl ichidan mos ma'lumot topilmadi. Yuqoridagi shablondan foydalanib ko'ring.")
+                        else:
+                            if not parsed["tx"].empty:
+                                if mode.startswith("Eskisini"):
+                                    replace_transactions(company["id"], parsed["tx"])
+                                else:
+                                    append_transactions(company["id"], parsed["tx"])
+                            if not parsed["debts"].empty:
+                                replace_debts(company["id"], parsed["debts"])
+                            if not parsed["inv"].empty:
+                                replace_inventory(company["id"], parsed["inv"])
+                            st.success("Muvaffaqiyatli yuklandi! " + " ".join(parsed["messages"]))
+                            st.rerun()
+                    except Exception as exc:
+                        st.error(f"Faylni o'qishda xatolik: {exc}")
 
-        fig_cf = go.Figure()
-        fig_cf.add_trace(go.Scatter(x=cf["fc"]["Sana"], y=cf["fc"]["Balans"], mode="lines+markers", name="Kassa Balansi", line=dict(color="#2563EB", width=3), fill="tozeroy"))
-        fig_cf.add_hline(y=0, line_dash="dash", line_color="#EF4444")
-        fig_cf.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig_cf, use_container_width=True)
+        with t_manual:
+            st.caption("Quyidagi jadvallarda Excel kabi to'g'ridan-to'g'ri yozishingiz, yangi qator (+) qo'shishingiz va saqlashingiz mumkin.")
+            m1, m2, m3 = st.tabs(["Savdo ro'yxati", "Qarzlar ro'yxati", "Ombor ro'yxati"])
 
-        st.divider()
-        st.subheader("🧾 Debitor va Kreditor Qarzlar (Aging)")
-        if analysis["debts"] is None:
-            st.info("Qarzlar kiritilmagan. '✍️ Ma'lumot Kiritish' → '🧾 Qarzlar kiritish' bo'limidan qo'shing.")
-        else:
-            dr = analysis["debts"]
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Jami Debitor", fmt_money(dr["ar_total"], curr))
-            d2.metric("Muddati o'tgan Debitor", fmt_money(dr["ar_over"], curr), delta=f"90+ kun: {fmt_money(dr['ar_crit'], curr)}", delta_color="inverse" if dr["ar_crit"] > 0 else "off")
-            d3.metric("Jami Kreditor", fmt_money(dr["ap_total"], curr))
-            d4.metric("Muddati o'tgan Kreditor", fmt_money(dr["ap_over"], curr))
+            with m1:
+                edit_tx = tx_df[["tx_date", "category", "item_name", "qty", "revenue", "cogs", "opex"]].copy() if not tx_df.empty else pd.DataFrame(
+                    columns=["tx_date", "category", "item_name", "qty", "revenue", "cogs", "opex"]
+                )
+                edit_tx.columns = ["Sana", "Bo'lim", "Mahsulot nomi", "Miqdor", "Tushum", "Tannarx", "Boshqa xarajat"]
+                edited_tx = st.data_editor(edit_tx, num_rows="dynamic", use_container_width=True, key="ed_tx")
+                if st.button("💾 Savdo jadvalini saqlash", type="primary"):
+                    save_df = edited_tx.rename(columns={
+                        "Sana": "tx_date", "Bo'lim": "category", "Mahsulot nomi": "item_name",
+                        "Miqdor": "qty", "Tushum": "revenue", "Tannarx": "cogs", "Boshqa xarajat": "opex"
+                    })
+                    replace_transactions(company["id"], save_df)
+                    st.success("Savdo ma'lumotlari saqlandi!")
+                    st.rerun()
 
-            age_df = dr["df"].groupby(["Guruh", "debt_type"], as_index=False)["amount"].sum()
-            fig_a = px.bar(age_df, x="Guruh", y="amount", color="debt_type", barmode="group", text_auto=".2s")
-            fig_a.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_a, use_container_width=True)
-            st.dataframe(dr["df"][["partner", "debt_type", "due_date", "Kechikish_kuni", "Guruh", "amount"]].style.format({"amount": "{:,.0f}"}), use_container_width=True)
+            with m2:
+                edit_d = debts_df[["counterparty", "debt_type", "amount", "due_date", "status"]].copy() if not debts_df.empty else pd.DataFrame(
+                    columns=["counterparty", "debt_type", "amount", "due_date", "status"]
+                )
+                edit_d.columns = ["Hamkor nomi", "Qarz turi", "Summa", "To'lov muddati", "Holati"]
+                edited_d = st.data_editor(
+                    edit_d,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "Qarz turi": st.column_config.SelectboxColumn(options=["Bizga qarzdor", "Bizning qarzimiz"]),
+                        "Holati": st.column_config.SelectboxColumn(options=["Muddatida", "Kechikkan", "To'langan"]),
+                    },
+                    key="ed_debts",
+                )
+                if st.button("💾 Qarzlar jadvalini saqlash", type="primary"):
+                    save_d = edited_d.rename(columns={
+                        "Hamkor nomi": "counterparty", "Qarz turi": "debt_type",
+                        "Summa": "amount", "To'lov muddati": "due_date", "Holati": "status"
+                    })
+                    replace_debts(company["id"], save_d)
+                    st.success("Qarzlar saqlandi!")
+                    st.rerun()
 
-tab_idx += 1
+            with m3:
+                edit_i = inv_df[["item_name", "category", "qty", "unit_cost", "last_sale_date"]].copy() if not inv_df.empty else pd.DataFrame(
+                    columns=["item_name", "category", "qty", "unit_cost", "last_sale_date"]
+                )
+                edit_i.columns = ["Mahsulot nomi", "Bo'lim", "Qoldiq soni", "Birlik tannarxi", "Oxirgi sotilgan sana"]
+                edited_i = st.data_editor(edit_i, num_rows="dynamic", use_container_width=True, key="ed_inv")
+                if st.button("💾 Ombor jadvalini saqlash", type="primary"):
+                    save_i = edited_i.rename(columns={
+                        "Mahsulot nomi": "item_name", "Bo'lim": "category",
+                        "Qoldiq soni": "qty", "Birlik tannarxi": "unit_cost", "Oxirgi sotilgan sana": "last_sale_date"
+                    })
+                    replace_inventory(company["id"], save_i)
+                    st.success("Ombor ma'lumotlari saqlandi!")
+                    st.rerun()
 
-# =========================================================
-# TAB 4 (IXTIYORIY): OMBOR & DEAD STOCK
-# =========================================================
-if cfg["uses_inventory"]:
-    with tabs[tab_idx]:
-        if not analysis["has_tx"] or analysis["inventory"] is None:
-            st.info("Ombor tahlili uchun '✍️ Ma'lumot Kiritish' → '📦 Ombor kiritish' bo'limidan zaxiralarni kiriting.")
-        else:
-            inv = analysis["inventory"]
-            i1, i2, i3 = st.columns(3)
-            i1.metric("Jami Ombor Qiymati", fmt_money(inv["total_val"], curr))
-            i2.metric("O'lik Tovarlar (90+ kun)", fmt_money(inv["dead_val"], curr), delta=f"{inv['dead_cnt']} ta pozitsiya", delta_color="inverse")
-            i3.metric("Muzlatilgan Kapital Ulushi", f"{(inv['dead_val']/inv['total_val']*100) if inv['total_val'] > 0 else 0:.1f}%")
+        with t_prof:
+            st.caption("Bu oddiy savollarga javob bersangiz, tizim faqat pulingizni emas, jamoa, mijozlar va xavfsizlikni ham aniq baholab beradi.")
+            with st.form("profile_form"):
+                st.markdown("#### 👥 Mijozlar va Reklama")
+                p1, p2, p3, p4 = st.columns(4)
+                davr = p1.number_input("Tahlil davri (necha kun?)", 7, 365, int(prof["davr_kun"]))
+                j_mijoz = p2.number_input("Jami mijozlar soni", 1, 100000, int(prof["jami_mijozlar"]))
+                y_mijoz = p3.number_input("Yangi kelgan mijozlar", 0, 100000, int(prof["yangi_mijozlar"]))
+                q_mijoz = p4.number_input("Qayta xarid qilganlar", 0, 100000, int(prof["qayta_mijozlar"]))
 
-            fig_inv = px.bar(inv["df"], x="Muzlatilgan_kapital", y="item_name", color="Holat", orientation="h",
-                             color_discrete_map={"O'lik tovar (Dead Stock)": "#EF4444", "Sekin aylanuvchi": "#F59E0B", "Sog'lom zaxira": "#10B981"})
-            fig_inv.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_inv, use_container_width=True)
-            st.dataframe(inv["df"][["item_name", "warehouse", "qty", "Muzlatilgan_kapital", "Sotilmagan_kun", "DIO_kun", "Holat"]].style.format({"Muzlatilgan_kapital": "{:,.0f}", "DIO_kun": "{:.0f} kun"}), use_container_width=True)
-    tab_idx += 1
+                p5, p6, p7 = st.columns(3)
+                rek = p5.number_input(f"Reklama xarajati ({curr})", 0.0, value=float(prof["reklama_xarajati"]), step=500_000.0)
+                davom = p6.number_input("Mijoz o'rtacha necha oy xarid qiladi?", 1.0, 120.0, float(prof["mijoz_davomiyligi_oy"]))
+                top3 = p7.slider("Eng yirik 3 ta mijoz savdoning necha % ini oladi?", 0, 100, int(prof["top3_mijoz_ulushi"]))
 
-# =========================================================
-# TAB 5: DIAGNOSTIKA, SIMULYATOR VA EXCEL HISOBOT EKSPORTI
-# =========================================================
-with tabs[tab_idx]:
-    if not analysis["has_tx"]:
-        st.info("Diagnostika va yechimlar uchun avval ma'lumotlaringizni kiriting.")
-    else:
-        st.subheader("🚨 Korxonani Pastga Tortayotgan Omillar va Aniq Yechimlar")
-        for level, sec, prob, sol in analysis["recs"]:
-            txt = f"**[{level} | {sec}]** {prob}\n\n✅ **Yechim:** {sol}"
-            if level == "Yuqori xavf":
-                st.error(txt)
-            elif level == "Ogohlantirish":
-                st.warning(txt)
+                st.markdown("#### 🧑‍💼 Xodimlar va Ish sifati")
+                h1, h2, h3, h4 = st.columns(4)
+                xodim = h1.number_input("Xodimlar soni", 1, 10000, int(prof["xodimlar_soni"]))
+                oylik = h2.number_input(f"Jami oylik fondi ({curr})", 0.0, value=float(prof["oylik_fondi"]), step=1_000_000.0)
+                ketgan = h3.number_input("Ishdan ketgan xodimlar", 0, 1000, int(prof["ketgan_xodimlar"]))
+                reja = h4.slider("Jamoa oylik rejani necha % bajardi?", 0, 100, int(prof["reja_bajarilishi"]))
+
+                o1, o2, o3 = st.columns(3)
+                brak = o1.number_input("Qaytarilish / nuqson foizi (%)", 0.0, 100.0, float(prof["brak_qaytarilish"]), step=0.5)
+                band = o2.slider("Ish quvvati necha % band?", 0, 100, int(prof["quvvat_bandligi"]))
+                yetkaz = o3.slider("Asosiy yetkazib beruvchi ulushi (%)", 0, 100, int(prof["asosiy_yetkazuvchi_ulushi"]))
+
+                if st.form_submit_button("💾 Ma'lumotlarni saqlash", type="primary"):
+                    save_profile(company["id"], {
+                        "davr_kun": davr, "jami_mijozlar": j_mijoz, "yangi_mijozlar": y_mijoz,
+                        "qayta_mijozlar": q_mijoz, "reklama_xarajati": rek, "mijoz_davomiyligi_oy": davom,
+                        "top3_mijoz_ulushi": top3, "xodimlar_soni": xodim, "oylik_fondi": oylik,
+                        "ketgan_xodimlar": ketgan, "reja_bajarilishi": reja, "brak_qaytarilish": brak,
+                        "bajarilish_vaqti_kun": float(prof["bajarilish_vaqti_kun"]),
+                        "quvvat_bandligi": band, "asosiy_yetkazuvchi_ulushi": yetkaz,
+                    })
+                    st.success("Korxona ko'rsatkichlari yangilandi!")
+                    st.rerun()
+
+    # =====================================================
+    # 3-BO'LIM: SAVDO VA MAHSULOTLAR
+    # =====================================================
+    elif menu == "📊 Savdo va Mahsulotlar":
+        if tx_df.empty:
+            st.info("Avval '📥 Ma'lumot kiritish' bo'limidan savdo ma'lumotlarini yuklang.")
+            st.stop()
+
+        s1, s2, s3 = st.tabs([
+            "🏆 Eng foydali va zararli mahsulotlar",
+            "⚖️ Zararsiz ishlash chegarasi",
+            "📦 Bo'limlar bo'yicha tahlil",
+        ])
+
+        with s1:
+            prod = res["prod_df"]
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Asosiy (Top) mahsulotlar", f"{int((prod['Daraja'] == 'Asosiy (Top)').sum())} ta", help="Tushumning 80% ini beruvchi eng muhim tovarlar")
+            mid_weak_cnt = int(prod["Daraja"].isin(["O'rtacha", "Zaif"]).sum())
+            k2.metric("O'rtacha va zaif mahsulotlar", f"{mid_weak_cnt} ta")
+            k3.metric("Zarar keltirayotganlar", f"{int((prod['Daraja'] == 'Zararli').sum())} ta")
+
+            fig_p = go.Figure()
+            fig_p.add_bar(
+                x=prod["item_name"],
+                y=prod["tushum"],
+                name="Savdo (Tushum)",
+                marker_color="#2563EB",
+            )
+            fig_p.add_bar(
+                x=prod["item_name"],
+                y=prod["sof_foyda"],
+                name="Sof foyda",
+                marker_color=["#16A34A" if v >= 0 else "#DC2626" for v in prod["sof_foyda"]],
+            )
+            fig_p.update_layout(
+                title="Mahsulotlar bo'yicha Savdo va Sof Foyda",
+                barmode="group",
+                height=380,
+                plot_bgcolor="#FFFFFF",
+                paper_bgcolor="#FFFFFF",
+                legend=dict(orientation="h", y=1.12),
+            )
+            st.plotly_chart(fig_p, use_container_width=True)
+
+            show_prod = prod[["item_name", "miqdor", "tushum", "sof_foyda", "Daraja", "Talab holati", "Maslahat"]].rename(
+                columns={"item_name": "Mahsulot", "miqdor": "Sotilgan soni", "tushum": f"Savdo ({curr})", "sof_foyda": f"Sof foyda ({curr})"}
+            )
+            st.dataframe(show_prod, use_container_width=True, hide_index=True)
+
+        with s2:
+            st.markdown(
+                """
+                <div class="hint-box">
+                    <b>Bu nima?</b> Korxonangiz zarar qilmasligi uchun kamida qancha savdo qilishi kerakligini ko'rsatadi.
+                    Pastdagi raqamlarni o'zgartirib, xarajat oshsa yoki kamaysa nima bo'lishini tekshirib ko'ring.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            sl1, sl2 = st.columns(2)
+            doimiy = sl1.number_input(f"Doimiy xarajatlar — ijara, oylik ({curr})", 0.0, value=float(res["opex"]), step=500_000.0)
+            tannarx_foiz = sl2.slider("Tannarx savdoning necha % ini oladi?", 5, 95, int(clamp(res["var_ratio"] * 100, 5, 95)))
+
+            cmr = 1.0 - (tannarx_foiz / 100.0)
+            bep = (doimiy / cmr) if cmr > 0 else float("inf")
+            zaxira = res["rev"] - bep if np.isfinite(bep) else -doimiy
+
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Minimal kerakli savdo", fmt_pul(bep, curr) if np.isfinite(bep) else "Hisoblanmadi")
+            b2.metric("Hozirgi savdongiz", fmt_pul(res["rev"], curr))
+            b3.metric("Xavfsizlik zaxirasi", fmt_pul(zaxira, curr), help="Savdo shuncha tushsa ham hali zarar qilmaysiz")
+
+            if np.isfinite(bep) and bep > 0:
+                max_x = max(res["rev"], bep) * 1.35
+                x_v = np.linspace(0, max_x, 40)
+                y_cost = doimiy + x_v * (tannarx_foiz / 100.0)
+                fig_b = go.Figure()
+                fig_b.add_scatter(x=x_v, y=x_v, name="Savdo (Tushum)", line=dict(color="#16A34A", width=3))
+                fig_b.add_scatter(x=x_v, y=y_cost, name="Jami xarajat", line=dict(color="#DC2626", width=3))
+                fig_b.add_scatter(
+                    x=[bep], y=[bep], mode="markers+text", name="Zararsizlik nuqtasi",
+                    text=[f"Chegara: {fmt_pul(bep, curr)}"], textposition="top left",
+                    marker=dict(size=12, color="#1E3A8A", symbol="diamond"),
+                )
+                fig_b.update_layout(
+                    height=380, xaxis_title=f"Savdo hajmi ({curr})", yaxis_title=f"Summa ({curr})",
+                    plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", legend=dict(orientation="h", y=1.12)
+                )
+                st.plotly_chart(fig_b, use_container_width=True)
+
+        with s3:
+            grp = res["tdf"].groupby("category", as_index=False).agg(
+                Savdo=("revenue", "sum"),
+                Tannarx=("cogs", "sum"),
+                Xarajat=("opex", "sum"),
+                Sof_foyda=("foyda", "sum"),
+            ).sort_values("Savdo", ascending=False)
+            fig_g = go.Figure(
+                go.Bar(
+                    x=grp["category"], y=grp["Sof_foyda"],
+                    marker_color=["#16A34A" if v >= 0 else "#DC2626" for v in grp["Sof_foyda"]],
+                    text=[fmt_pul(v, "") for v in grp["Sof_foyda"]], textposition="outside",
+                )
+            )
+            fig_g.update_layout(title="Bo'limlar bo'yicha Sof Foyda", height=360, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF")
+            st.plotly_chart(fig_g, use_container_width=True)
+            st.dataframe(grp.rename(columns={"category": "Bo'lim", "Sof_foyda": "Sof foyda"}), use_container_width=True, hide_index=True)
+
+    # =====================================================
+    # 4-BO'LIM: PUL, QARZ VA OMBOR
+    # =====================================================
+    elif menu == "💰 Pul, Qarz va Ombor":
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Bizga qarzdorlar", fmt_pul(res["receivables"], curr), delta=f"Kechikkan: {fmt_pul(res['overdue_rec'], curr)}" if res["overdue_rec"] > 0 else "Hammasi muddatida", delta_color="inverse" if res["overdue_rec"] > 0 else "normal")
+        q2.metric("Bizning qarzlarimiz", fmt_pul(res["payables"], curr))
+        q3.metric("Ombordagi tovar qiymati", fmt_pul(res["inv_val"], curr))
+        q4.metric("Pul aylanish vaqti", f"{res['pul_aylanish_kun']:.0f} kun", help="Tovarga tikilgan pul o'rtacha necha kunda naqd bo'lib qaytadi")
+
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        p_tab1, p_tab2, p_tab3 = st.tabs(["🔄 Pul qayerda to'xtab qolyapti?", "📋 Qarzlar nazorati", "📦 Ombor va sotilmagan tovarlar"])
+
+        with p_tab1:
+            st.caption("Tovar omborda qancha uzoq yotsa va mijozlar qarzni qancha kech to'lasa, kassangizda naqd pul shuncha kamayadi.")
+            fig_ccc = go.Figure(
+                go.Bar(
+                    x=["Tovar omborda yotishi", "Mijozdan qarz yig'ish", "Yetkazib beruvchiga kechiktirish", "Jami pul qaytish vaqti"],
+                    y=[res["ombor_kun"], res["qarz_olish_kun"], -res["qarz_berish_kun"], res["pul_aylanish_kun"]],
+                    marker_color=["#2563EB", "#D97706", "#16A34A", "#DC2626" if res["pul_aylanish_kun"] > 35 else "#1E3A8A"],
+                    text=[f"{v:.0f} kun" for v in [res["ombor_kun"], res["qarz_olish_kun"], -res["qarz_berish_kun"], res["pul_aylanish_kun"]]],
+                    textposition="outside",
+                )
+            )
+            fig_ccc.update_layout(height=360, yaxis_title="Kunlar", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF")
+            st.plotly_chart(fig_ccc, use_container_width=True)
+
+        with p_tab2:
+            if res["ddf"].empty:
+                st.info("Hozircha qarzlar kiritilmagan.")
             else:
-                st.info(txt)
+                show_d = res["ddf"][["counterparty", "debt_type", "amount", "due_date", "status"]].rename(
+                    columns={"counterparty": "Hamkor", "debt_type": "Qarz turi", "amount": f"Summa ({curr})", "due_date": "To'lov muddati", "status": "Holati"}
+                )
+                st.dataframe(show_d, use_container_width=True, hide_index=True)
 
-        st.divider()
-        st.subheader("🎛️ 'Agar...' (What-If) Qaror Simulyatori")
-        s1, s2, s3 = st.columns(3)
-        p_chg = s1.slider("Narxni o'zgartirish (%)", -20, 30, 5)
-        c_cut = s2.slider(f"{cfg['cogs_label']} ni kamaytirish (%)", 0, 30, 5)
-        o_cut = s3.slider("OPEX ni qisqartirish (%)", 0, 40, 10)
-        drop_bad = st.checkbox("Zararli pozitsiyalarni chiqarib tashlash", value=True)
+        with p_tab3:
+            if res["idf"].empty:
+                st.info("Hozircha ombor ma'lumotlari kiritilmagan.")
+            else:
+                if not res["dead_items"].empty:
+                    st.warning(f"Diqqat! Omborda {len(res['dead_items'])} ta tovar uzoq vaqtdan beri sotilmay yotibdi (jami {fmt_pul(res['dead_stock_val'], curr)}).")
+                show_i = res["idf"][["item_name", "category", "qty", "unit_cost", "jami_qiymat", "yotgan_kun"]].rename(
+                    columns={
+                        "item_name": "Mahsulot", "category": "Bo'lim", "qty": "Qoldiq",
+                        "unit_cost": "Birlik tannarxi", "jami_qiymat": f"Jami qiymat ({curr})", "yotgan_kun": "Necha kundan beri sotilmadi"
+                    }
+                )
+                st.dataframe(show_i, use_container_width=True, hide_index=True)
 
-        sdf = analysis["df"].copy()
-        if drop_bad and not analysis["loss_items"].empty:
-            sdf = sdf[~sdf["item_name"].isin(analysis["loss_items"]["item_name"].tolist())]
-        s_rev = sdf["revenue"].sum() * (1 + p_chg / 100)
-        s_cogs = sdf["cogs"].sum() * (1 - c_cut / 100)
-        s_opex = sdf["opex"].sum() * (1 - o_cut / 100)
-        s_net = s_rev - s_cogs - s_opex
+    # =====================================================
+    # 5-BO'LIM: MUAMMOLAR, REJA, PROGNOZ VA HISOBOT
+    # =====================================================
+    elif menu == "🩺 Muammolar, Reja va Hisobot":
+        r1, r2, r3, r4 = st.tabs([
+            "🎯 Biznes bahosi va Muammolar",
+            "🗺️ 3 Oylik Harakatlar Rejasi",
+            "📈 Kelgusi 12 Oylik Prognoz",
+            "📄 Tayyor Hisobot (PDF / Excel)",
+        ])
 
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Hozirgi Sof Foyda", fmt_money(analysis["kpi"]["net"], curr))
-        r2.metric("Prognoz Sof Foyda", fmt_money(s_net, curr), delta=fmt_money(s_net - analysis["kpi"]["net"], curr))
-        s_m = (s_net / s_rev * 100) if s_rev > 0 else 0.0
-        r3.metric("Yangi Marja", f"{s_m:.1f}%", delta=f"{s_m - analysis['kpi']['margin']:.1f}%")
+        with r1:
+            col_rad, col_tbl = st.columns([1.2, 1])
+            with col_rad:
+                cats = list(res["ballar"].keys())
+                vals = list(res["ballar"].values())
+                fig_rad = go.Figure()
+                fig_rad.add_trace(go.Scatterpolar(r=vals + [vals[0]], theta=cats + [cats[0]], fill="toself", name="Sizning korxonangiz", line=dict(color="#1E3A8A", width=2.5), fillcolor="rgba(37,99,235,0.22)"))
+                fig_rad.add_trace(go.Scatterpolar(r=[80] * (len(cats) + 1), theta=cats + [cats[0]], name="Yaxshi daraja (80)", line=dict(color="#16A34A", dash="dash")))
+                fig_rad.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), height=360, margin=dict(l=40, r=40, t=30, b=30), legend=dict(orientation="h", y=-0.12))
+                st.plotly_chart(fig_rad, use_container_width=True)
 
-        st.divider()
-        st.subheader("📤 Tayyor Tahliliy Hisobotni Yuklab Olish")
-        st.download_button(
-            label="📥 To'liq Tahlil Natijalarini Excel (.xlsx) qilib yuklab olish",
-            data=export_analysis_excel(tx_df, analysis["item_df"], analysis["group_df"], debts_df, inv_df),
-            file_name=f"{company['name'].replace(' ', '_')}_hisobot.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
-        from pro_modules import render_pro_analytics
-        render_pro_analytics(tx_df, analysis, company["name"], curr)
-        from enterprise_360 import render_enterprise_360
-        render_enterprise_360(tx_df, debts_df, inv_df, company["name"], curr)
+            with col_tbl:
+                st.subheader(f"Umumiy baho: {res['umumiy_ball']:.0f} / 100")
+                b_df = pd.DataFrame([
+                    {"Yo'nalish": k, "Ball": v, "Izoh": "Yaxshi" if v >= 75 else ("Yaxshilash kerak" if v >= 55 else "Zaif joy!")}
+                    for k, v in res["ballar"].items()
+                ])
+                st.dataframe(b_df, use_container_width=True, hide_index=True)
+
+            st.subheader("🔍 Aniqlangan muammolar va aniq yechimlar")
+            for idx, m in enumerate(res["muammolar"], start=1):
+                render_issue_card(idx, m)
+
+        with r2:
+            st.caption("Barcha muammolar muhimligiga qarab 3 oyga bo'lib berildi — birinchi oyda eng shoshilinch ishlardan boshlang.")
+            c30, c60, c90 = st.columns(3)
+            stages = [
+                ("1-oy (Shoshilinch)", c30, "🚨 1-oy: Tezkor natija"),
+                ("2-oy (Tartibga solish)", c60, "🔧 2-oy: Tizimni sozlash"),
+                ("3-oy (Rivojlanish)", c90, "🚀 3-oy: Barqaror o'sish"),
+            ]
+            for key, col_box, title in stages:
+                with col_box:
+                    st.markdown(f"### {title}")
+                    items = [x for x in res["muammolar"] if x["bosqich"] == key]
+                    if not items:
+                        st.info("Bu bosqichda shoshilinch muammo yo'q.")
+                    for item in items:
+                        with st.container(border=True):
+                            st.markdown(f"**{item['bolim']}:** {item['muammo']}")
+                            st.write(item["yechim"])
+                            st.caption(f"Kutilayotgan foyda: {item['samara_matn']}")
+
+        with r3:
+            if res["rev"] <= 0:
+                st.info("Prognoz ko'rish uchun avval savdo ma'lumotlarini kiriting.")
+            else:
+                fc = res["forecast_df"]
+                f1, f2, f3 = st.columns(3)
+                f1.metric("Hozirgi holatda (1 yilda)", fmt_pul(fc["Hozirgi holat"].sum(), curr))
+                f2.metric("Reja bajarilganda (1 yilda)", fmt_pul(fc["Reja bajarilganda"].sum(), curr), delta=fmt_pul(fc["Reja bajarilganda"].sum() - fc["Hozirgi holat"].sum(), curr))
+                f3.metric("Yomon holatda (ehtiyot chorasi)", fmt_pul(fc["Yomon holat"].sum(), curr))
+
+                fig_f = go.Figure()
+                fig_f.add_scatter(x=fc["Oy"], y=fc["Reja bajarilganda"], name="Reja bajarilganda (Yaxshi)", mode="lines+markers", line=dict(color="#16A34A", width=3))
+                fig_f.add_scatter(x=fc["Oy"], y=fc["Hozirgi holat"], name="Hozirgi holat (O'rtacha)", mode="lines+markers", line=dict(color="#2563EB", width=2.5))
+                fig_f.add_scatter(x=fc["Oy"], y=fc["Yomon holat"], name="Yomon holat (Bozor tushsa)", mode="lines+markers", line=dict(color="#DC2626", dash="dash"))
+                fig_f.add_hline(y=0, line_dash="dot", line_color="#64748B")
+                fig_f.update_layout(title="Kelgusi 12 oyda oylik sof foyda qanday o'zgaradi?", height=400, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", legend=dict(orientation="h", y=1.12))
+                st.plotly_chart(fig_f, use_container_width=True)
+
+        with r4:
+            st.markdown(
+                """
+                <div class="hint-box">
+                    Rahbar, hamkor yoki investorlarga ko'rsatish uchun barcha natijalar, baholar va yechimlar jamlangan tayyor hisobotni bir tugma bilan yuklab oling.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            dl1, dl2 = st.columns(2)
+            safe_fn = re.sub(r"[^A-Za-z0-9_-]", "_", company["name"])
+            with dl1:
+                if FPDF_AVAILABLE:
+                    pdf_data = build_pdf_report(company, res)
+                    st.download_button(
+                        "📄 Tayyor PDF hisobotni yuklab olish",
+                        data=pdf_data,
+                        file_name=f"{safe_fn}_hisobot.pdf",
+                        mime="application/pdf",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning("PDF uchun GitHub'dagi requirements.txt faylida 'fpdf2' bo'lishi kerak.")
+            with dl2:
+                xl_data = build_excel_report(company, res)
+                st.download_button(
+                    "📊 To'liq Excel hisobotni yuklab olish",
+                    data=xl_data,
+                    file_name=f"{safe_fn}_tahlil.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+
+if __name__ == "__main__":
+    main()
