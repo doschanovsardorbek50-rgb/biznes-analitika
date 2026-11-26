@@ -1092,3 +1092,5 @@ with tabs[tab_idx]:
         )
         from pro_modules import render_pro_analytics
         render_pro_analytics(tx_df, analysis, company["name"], curr)
+        from enterprise_360 import render_enterprise_360
+        render_enterprise_360(tx_df, debts_df, inv_df, company["name"], curr)
