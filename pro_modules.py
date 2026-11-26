@@ -310,7 +310,8 @@ def generate_pdf_report(company_name: str, curr: str, tx_df: pd.DataFrame, analy
         notes.append(f"- 'A' toifadagi asosiy {a_cnt} ta mahsulot biznes tushumining asosiy qismini bermoqda - ular doim omborda bo'lsin.")
 
     for note in notes:
-        pdf.multi_cell(0, 6, _clean_pdf_text(note))
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin, 6, _clean_pdf_text(note))
 
     out = pdf.output(dest="S")
     return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
